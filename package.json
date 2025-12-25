@@ -1,0 +1,44 @@
+{
+  "name": "dln-solana-dashboard",
+  "version": "1.0.0",
+  "description": "Dashboard for DLN order events on Solana - OrderCreated and OrderFulfilled",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "collect": "tsx src/collector/index.ts",
+    "api": "tsx src/api/server.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "dashboard": "cd dashboard && npm run dev",
+    "install:all": "npm install && cd dashboard && npm install"
+  },
+  "keywords": [
+    "solana",
+    "debridge",
+    "dln",
+    "blockchain",
+    "dashboard",
+    "clickhouse"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@clickhouse/client": "^1.8.1",
+    "@solana/web3.js": "^1.95.4",
+    "bs58": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "pino": "^9.5.0",
+    "pino-pretty": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
