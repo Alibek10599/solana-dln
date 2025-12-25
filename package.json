@@ -12,7 +12,14 @@
     "api": "tsx src/api/server.ts",
     "migrate": "tsx src/db/migrate.ts",
     "dashboard": "cd dashboard && npm run dev",
-    "install:all": "npm install && cd dashboard && npm install"
+    "install:all": "npm install && cd dashboard && npm install",
+    
+    "temporal:worker": "tsx src/temporal/worker.ts",
+    "temporal:start": "tsx src/temporal/client.ts start",
+    "temporal:status": "tsx src/temporal/client.ts status",
+    "temporal:pause": "tsx src/temporal/client.ts pause",
+    "temporal:resume": "tsx src/temporal/client.ts resume",
+    "temporal:cancel": "tsx src/temporal/client.ts cancel"
   },
   "keywords": [
     "solana",
@@ -20,13 +27,18 @@
     "dln",
     "blockchain",
     "dashboard",
-    "clickhouse"
+    "clickhouse",
+    "temporal"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "@clickhouse/client": "^1.8.1",
     "@solana/web3.js": "^1.95.4",
+    "@temporalio/activity": "^1.11.4",
+    "@temporalio/client": "^1.11.4",
+    "@temporalio/worker": "^1.11.4",
+    "@temporalio/workflow": "^1.11.4",
     "bs58": "^6.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",

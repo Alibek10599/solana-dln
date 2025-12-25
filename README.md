@@ -308,14 +308,120 @@ npx tsx watch src/api/server.ts
 cd dashboard && npm run dev
 ```
 
-## Scaling Considerations
+## Temporal-Based Collection (Recommended for Production)
 
-For a production system processing millions of orders:
+For production systems, the project includes a **Temporal-based collector** that provides:
 
-1. **Use Temporal** - For durable workflows with automatic retry and state persistence
-2. **Horizontal scaling** - Multiple collector workers with different signature ranges
-3. **Streaming** - Use Geyser plugins or Yellowstone gRPC for real-time updates
-4. **ClickHouse cluster** - For higher insert throughput and query performance
+- **Durable execution** - Survives crashes and restarts
+- **Automatic retries** - Per-activity retry policies
+- **Queryable state** - Check progress anytime
+- **Pause/Resume** - Control collection via signals
+- **Long-running support** - Uses `continueAsNew` to avoid history limits
+- **Visibility** - Full workflow history in Temporal UI
+
+### Temporal Quick Start
+
+```bash
+# 1. Start all services (ClickHouse + Temporal + UI)
+docker-compose up -d
+
+# 2. Wait for Temporal to be ready (~30 seconds)
+docker-compose logs -f temporal
+
+# 3. Start the worker (in a separate terminal)
+npm run temporal:worker
+
+# 4. Start the collection workflow
+npm run temporal:start
+
+# 5. Check status
+npm run temporal:status
+
+# 6. View in Temporal UI
+open http://localhost:8233
+```
+
+### Temporal Commands
+
+| Command | Description |
+|---------|-------------|
+| `npm run temporal:worker` | Start the worker (must be running) |
+| `npm run temporal:start` | Start collection workflow |
+| `npm run temporal:status` | Check progress |
+| `npm run temporal:pause` | Pause collection |
+| `npm run temporal:resume` | Resume paused collection |
+| `npm run temporal:cancel` | Cancel collection |
+
+### Temporal Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Temporal Server                           │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │              collectAllOrdersWorkflow                  │  │
+│  │                                                        │  │
+│  │    ┌─────────────────────────────────────────────┐    │  │
+│  │    │         collectOrdersWorkflow (created)      │    │  │
+│  │    │  ┌──────────┐ ┌──────────┐ ┌──────────┐     │    │  │
+│  │    │  │ fetchSigs │→│ parseTxs │→│ storeEvts│     │    │  │
+│  │    │  └──────────┘ └──────────┘ └──────────┘     │    │  │
+│  │    │        ↑           ↑           ↑            │    │  │
+│  │    │        └───── Retry Policies ──┘            │    │  │
+│  │    └─────────────────────────────────────────────┘    │  │
+│  │                                                        │  │
+│  │    ┌─────────────────────────────────────────────┐    │  │
+│  │    │        collectOrdersWorkflow (fulfilled)     │    │  │
+│  │    │              (same structure)                │    │  │
+│  │    └─────────────────────────────────────────────┘    │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                                                              │
+│  Features:                                                   │
+│  ✓ Automatic checkpointing (survives crashes)               │
+│  ✓ Per-activity retry policies                              │
+│  ✓ Queryable state via signals                              │
+│  ✓ Pause/Resume capability                                  │
+│  ✓ Full history in Temporal UI                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Retry Policies (Temporal Activities)
+
+| Activity | Timeout | Max Retries | Backoff |
+|----------|---------|-------------|----------|
+| `fetchSignaturesBatch` | 2 min | 10 | 2s → 30s |
+| `fetchAndParseTransactions` | 5 min | 5 | 3s → 60s |
+| `storeEvents` | 1 min | 5 | 1s → 10s |
+| `getProgress` | 30s | 3 | default |
+
+### Scaling with Temporal
+
+For horizontal scaling, run multiple workers:
+
+```bash
+# Terminal 1: Worker 1
+TEMPORAL_WORKER_ID=worker-1 npm run temporal:worker
+
+# Terminal 2: Worker 2  
+TEMPORAL_WORKER_ID=worker-2 npm run temporal:worker
+
+# Terminal 3: Worker 3
+TEMPORAL_WORKER_ID=worker-3 npm run temporal:worker
+```
+
+Temporal automatically distributes activities across workers.
+
+## Comparison: Simple vs Temporal Collector
+
+| Feature | Simple Collector | Temporal Collector |
+|---------|------------------|-------------------|
+| Setup complexity | Low | Medium |
+| Crash recovery | Manual restart | Automatic |
+| Progress visibility | Logs only | UI + Queries |
+| Pause/Resume | No | Yes |
+| Retry logic | Application code | Declarative policies |
+| Horizontal scaling | Manual | Built-in |
+| History/Audit | None | Full history |
+| Best for | Development, small jobs | Production, large jobs |
 
 ## License
 

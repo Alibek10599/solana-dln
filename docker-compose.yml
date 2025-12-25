@@ -1,6 +1,9 @@
 version: '3.8'
 
 services:
+  # ============================================================
+  # ClickHouse - Analytics Database
+  # ============================================================
   clickhouse:
     image: clickhouse/clickhouse-server:24.3
     container_name: dln-clickhouse
@@ -25,6 +28,80 @@ services:
       timeout: 5s
       retries: 3
 
+  # ============================================================
+  # Temporal - Durable Workflow Engine
+  # ============================================================
+  # Using the auto-setup image which includes:
+  # - Temporal server
+  # - PostgreSQL for persistence
+  # - Elasticsearch for visibility (optional)
+  temporal:
+    image: temporalio/auto-setup:1.24
+    container_name: dln-temporal
+    ports:
+      - "7233:7233"  # gRPC frontend
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-db
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    depends_on:
+      temporal-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "temporal", "workflow", "list", "--address", "localhost:7233"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  temporal-db:
+    image: postgres:15
+    container_name: dln-temporal-db
+    ports:
+      - "5433:5432"  # Different port to avoid conflicts
+    environment:
+      - POSTGRES_USER=temporal
+      - POSTGRES_PASSWORD=temporal
+      - POSTGRES_DB=temporal
+    volumes:
+      - temporal-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Temporal Web UI
+  temporal-ui:
+    image: temporalio/ui:2.26.2
+    container_name: dln-temporal-ui
+    ports:
+      - "8233:8080"  # Web UI
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - temporal
+
+  # ============================================================
+  # Temporal Admin Tools (optional, for debugging)
+  # ============================================================
+  temporal-admin-tools:
+    image: temporalio/admin-tools:1.24
+    container_name: dln-temporal-admin
+    stdin_open: true
+    tty: true
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    depends_on:
+      - temporal
+    profiles:
+      - tools  # Only start with: docker-compose --profile tools up
+
 volumes:
   clickhouse-data:
   clickhouse-logs:
+  temporal-db-data:
