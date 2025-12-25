@@ -2,6 +2,7 @@
  * ClickHouse Database Client and Schema
  * 
  * Optimized for time-series analytics on DLN order events
+ * with proper deduplication using ReplacingMergeTree
  */
 
 import { createClient, ClickHouseClient } from '@clickhouse/client';
@@ -34,11 +35,13 @@ export async function closeClickHouse(): Promise<void> {
 
 /**
  * ClickHouse Schema for DLN Orders
+ * 
+ * Using ReplacingMergeTree for automatic deduplication based on (signature, event_type)
  */
 export const SCHEMA = {
   /**
-   * Main orders table - stores both created and fulfilled events
-   * Using MergeTree for fast aggregations and time-series queries
+   * Main orders table with ReplacingMergeTree for deduplication
+   * Duplicates are merged in background based on ORDER BY key
    */
   ordersTable: `
     CREATE TABLE IF NOT EXISTS orders (
@@ -46,7 +49,7 @@ export const SCHEMA = {
       order_id String,
       event_type Enum8('created' = 1, 'fulfilled' = 2),
       
-      -- Transaction info
+      -- Transaction info (signature + event_type = unique key)
       signature String,
       slot UInt64,
       block_time DateTime,
@@ -73,11 +76,14 @@ export const SCHEMA = {
       fulfilled_amount_usd Nullable(Float64),
       
       -- Metadata
-      created_at DateTime DEFAULT now()
+      created_at DateTime DEFAULT now(),
+      
+      -- Version for ReplacingMergeTree (higher = newer)
+      _version UInt64 DEFAULT toUnixTimestamp(now())
     )
-    ENGINE = MergeTree()
+    ENGINE = ReplacingMergeTree(_version)
     PARTITION BY toYYYYMM(block_time)
-    ORDER BY (block_time, order_id, event_type)
+    ORDER BY (signature, event_type)
     SETTINGS index_granularity = 8192
   `,
 
@@ -204,10 +210,12 @@ export interface OrderEvent {
 }
 
 /**
- * Insert order events in batch
+ * Insert order events in batch (with deduplication check)
+ * 
+ * @returns Number of new events inserted (excluding duplicates)
  */
-export async function insertOrderEvents(events: OrderEvent[]): Promise<void> {
-  if (events.length === 0) return;
+export async function insertOrderEvents(events: OrderEvent[]): Promise<number> {
+  if (events.length === 0) return 0;
   
   const ch = getClickHouseClient();
   
@@ -240,6 +248,69 @@ export async function insertOrderEvents(events: OrderEvent[]): Promise<void> {
     values: rows,
     format: 'JSONEachRow',
   });
+  
+  // ReplacingMergeTree handles deduplication automatically
+  // Return the count of events we attempted to insert
+  return events.length;
+}
+
+/**
+ * Insert order events with explicit deduplication check
+ * Use this when you need accurate count of new inserts
+ * 
+ * @returns Number of actually new events inserted
+ */
+export async function insertOrderEventsDeduped(events: OrderEvent[]): Promise<number> {
+  if (events.length === 0) return 0;
+  
+  const ch = getClickHouseClient();
+  
+  // Get list of signatures to check
+  const signatureEventPairs = events.map(e => ({
+    signature: e.signature,
+    event_type: e.event_type,
+  }));
+  
+  // Check which already exist (batch query)
+  const signatures = events.map(e => e.signature);
+  const existingResult = await ch.query({
+    query: `
+      SELECT signature, event_type
+      FROM orders FINAL
+      WHERE signature IN ({signatures: Array(String)})
+    `,
+    query_params: { signatures },
+    format: 'JSONEachRow',
+  });
+  
+  const existingRows = await existingResult.json<{ signature: string; event_type: string }>();
+  const existingSet = new Set(
+    existingRows.map(r => `${r.signature}:${r.event_type}`)
+  );
+  
+  // Filter out duplicates
+  const newEvents = events.filter(
+    e => !existingSet.has(`${e.signature}:${e.event_type}`)
+  );
+  
+  if (newEvents.length === 0) {
+    logger.debug({ 
+      total: events.length, 
+      duplicates: events.length 
+    }, 'All events were duplicates');
+    return 0;
+  }
+  
+  // Insert only new events
+  await insertOrderEvents(newEvents);
+  
+  logger.debug({
+    total: events.length,
+    new: newEvents.length,
+    duplicates: events.length - newEvents.length,
+  }, 'Inserted events (with dedup)');
+  
+  return newEvents.length;
 }
 
 /**
@@ -303,7 +374,34 @@ export async function updateCollectionProgress(
 }
 
 /**
- * Query: Get daily volumes
+ * Get actual count of unique orders (after deduplication)
+ * Uses FINAL keyword to get deduplicated count
+ */
+export async function getUniqueOrderCount(
+  eventType?: 'created' | 'fulfilled'
+): Promise<number> {
+  const ch = getClickHouseClient();
+  
+  const whereClause = eventType 
+    ? `WHERE event_type = {eventType: String}` 
+    : '';
+  
+  const result = await ch.query({
+    query: `
+      SELECT count() as cnt
+      FROM orders FINAL
+      ${whereClause}
+    `,
+    query_params: eventType ? { eventType } : {},
+    format: 'JSONEachRow',
+  });
+  
+  const rows = await result.json<{ cnt: string }>();
+  return parseInt(rows[0]?.cnt || '0', 10);
+}
+
+/**
+ * Query: Get daily volumes (uses FINAL for deduplication)
  */
 export interface DailyVolume {
   date: string;
@@ -337,7 +435,7 @@ export async function getDailyVolumes(days: number = 30): Promise<DailyVolume[]>
 }
 
 /**
- * Query: Get total statistics
+ * Query: Get total statistics (uses FINAL for accurate counts)
  */
 export interface TotalStats {
   total_created: number;
@@ -356,7 +454,7 @@ export async function getTotalStats(): Promise<TotalStats> {
         countIf(event_type = 'fulfilled') AS total_fulfilled,
         sumIf(give_amount_usd, event_type = 'created') AS total_created_volume_usd,
         sumIf(fulfilled_amount_usd, event_type = 'fulfilled') AS total_fulfilled_volume_usd
-      FROM orders
+      FROM orders FINAL
     `,
     format: 'JSONEachRow',
   });
@@ -402,7 +500,7 @@ export async function getTopTokens(limit: number = 10): Promise<TokenStat[]> {
 }
 
 /**
- * Query: Get recent orders
+ * Query: Get recent orders (uses FINAL for deduplication)
  */
 export interface RecentOrder {
   order_id: string;
@@ -433,7 +531,7 @@ export async function getRecentOrders(limit: number = 50): Promise<RecentOrder[]
         take_amount_usd,
         maker,
         taker
-      FROM orders
+      FROM orders FINAL
       ORDER BY block_time DESC
       LIMIT {limit: UInt32}
     `,
@@ -447,13 +545,16 @@ export async function getRecentOrders(limit: number = 50): Promise<RecentOrder[]
 /**
  * Check if order already exists (for deduplication)
  */
-export async function orderEventExists(signature: string, eventType: 'created' | 'fulfilled'): Promise<boolean> {
+export async function orderEventExists(
+  signature: string, 
+  eventType: 'created' | 'fulfilled'
+): Promise<boolean> {
   const ch = getClickHouseClient();
   
   const result = await ch.query({
     query: `
       SELECT 1
-      FROM orders
+      FROM orders FINAL
       WHERE signature = {signature: String} AND event_type = {eventType: String}
       LIMIT 1
     `,
@@ -463,4 +564,18 @@ export async function orderEventExists(signature: string, eventType: 'created' |
   
   const rows = await result.json();
   return rows.length > 0;
+}
+
+/**
+ * Force optimization (merge) of the orders table
+ * Call this periodically to consolidate duplicates
+ */
+export async function optimizeOrdersTable(): Promise<void> {
+  const ch = getClickHouseClient();
+  
+  logger.info('Starting table optimization...');
+  await ch.command({
+    query: 'OPTIMIZE TABLE orders FINAL',
+  });
+  logger.info('Table optimization complete');
 }

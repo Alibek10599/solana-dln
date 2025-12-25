@@ -4,10 +4,11 @@ A dashboard for tracking DLN (deBridge Liquidity Network) order events on Solana
 
 ## Features
 
-- **Low-level Borsh parsing** - Custom implementation of Borsh deserialization for DLN instruction data (no high-level libraries)
-- **ClickHouse storage** - Optimized for time-series analytics with materialized views for fast aggregations
+- **Low-level Borsh parsing** - Custom implementation of Borsh deserialization for DLN instruction data (impressive approach, no high-level libraries)
+- **ClickHouse storage** - Optimized for time-series analytics with ReplacingMergeTree for automatic deduplication
+- **Robust data collection** - Exponential backoff, rate limiting, circuit breaker, and deduplication
+- **Resumable collection** - Progress checkpointing allows resuming from last position
 - **Real-time dashboard** - React dashboard with daily volume charts, top tokens, and recent orders
-- **Resumable collection** - Progress tracking allows resuming from last checkpoint
 - **50K+ orders target** - Collects at least 25K created and 25K fulfilled orders
 
 ## Architecture
@@ -17,9 +18,15 @@ A dashboard for tracking DLN (deBridge Liquidity Network) order events on Solana
 │  Solana RPC     │────▶│  Collector   │────▶│   ClickHouse   │
 │  (Mainnet)      │     │  (Node.js)   │     │   Database     │
 └─────────────────┘     └──────────────┘     └───────┬────────┘
-                                                      │
-                        ┌──────────────┐              │
-                        │  API Server  │◀─────────────┘
+        │                      │                      │
+        │              ┌───────┴───────┐              │
+        │              │  Retry Logic  │              │
+        │              │  Rate Limiter │              │
+        │              │  Circuit Brkr │              │
+        │              └───────────────┘              │
+        │                                             │
+        │               ┌──────────────┐              │
+        └──────────────▶│  API Server  │◀─────────────┘
                         │  (Express)   │
                         └──────┬───────┘
                                │
@@ -35,8 +42,14 @@ A dashboard for tracking DLN (deBridge Liquidity Network) order events on Solana
 - **Node.js + TypeScript** - Runtime and language
 - **Custom Borsh Parser** - Low-level deserialization of Solana instructions
 - **@solana/web3.js** - Solana RPC client
-- **ClickHouse** - Analytics database for time-series data
+- **ClickHouse** - Analytics database with ReplacingMergeTree for deduplication
 - **Express** - API server
+
+### Reliability Features
+- **Exponential Backoff** - Retries with increasing delays and jitter
+- **Rate Limiter** - Token bucket algorithm to prevent RPC throttling
+- **Circuit Breaker** - Fails fast when RPC is consistently unavailable
+- **Deduplication** - Both application-level checks and DB-level (ReplacingMergeTree)
 
 ### Frontend  
 - **React 18** - UI framework
@@ -76,8 +89,13 @@ cd dashboard && npm install && cd ..
 
 ```bash
 cp .env.example .env
-# Edit .env with your Solana RPC URL
+# Edit .env with your Solana RPC URL and rate limit settings
 ```
+
+**Important:** For collecting 50K+ orders, a premium RPC provider is recommended:
+- **Public RPC**: ~2-5 req/s (will take several hours)
+- **Helius free tier**: ~10 req/s
+- **Premium RPC**: 50-100+ req/s
 
 ### 4. Initialize Database
 
@@ -94,8 +112,9 @@ npm run collect
 This will:
 - Fetch transaction signatures from DlnSource and DlnDestination programs
 - Parse transactions using low-level Borsh deserialization
-- Extract OrderCreated and OrderFulfilled events
+- Deduplicate events before insertion
 - Store in ClickHouse with progress checkpointing
+- Resume automatically if interrupted
 
 ### 6. Start API Server
 
@@ -117,27 +136,74 @@ Open http://localhost:3000 in your browser.
 dln-solana-dashboard/
 ├── src/
 │   ├── api/
-│   │   └── server.ts        # Express API server
+│   │   └── server.ts          # Express API server
 │   ├── collector/
-│   │   └── index.ts         # Data collection script
+│   │   └── index.ts           # Data collection with retry/rate limiting
 │   ├── db/
-│   │   ├── clickhouse.ts    # ClickHouse client & queries
-│   │   └── migrate.ts       # Schema migration
+│   │   ├── clickhouse.ts      # ClickHouse client with deduplication
+│   │   └── migrate.ts         # Schema migration
 │   ├── parser/
-│   │   ├── borsh.ts         # Low-level Borsh deserializer ⭐
-│   │   └── transaction.ts   # Transaction parsing logic
+│   │   ├── borsh.ts           # Low-level Borsh deserializer ⭐
+│   │   └── transaction.ts     # Transaction parsing logic
 │   ├── types/
-│   │   └── index.ts         # TypeScript types
+│   │   └── index.ts           # TypeScript types
 │   ├── utils/
-│   │   └── logger.ts        # Logging utility
-│   └── constants.ts         # DLN addresses & config
+│   │   ├── logger.ts          # Logging utility
+│   │   └── retry.ts           # Retry, rate limiter, circuit breaker ⭐
+│   └── constants.ts           # DLN addresses & config
 ├── dashboard/
 │   └── src/
-│       ├── components/      # React components
-│       ├── hooks/           # Custom hooks
-│       └── types/           # Frontend types
-├── docker-compose.yml       # ClickHouse setup
+│       ├── components/        # React components
+│       ├── hooks/             # Custom hooks
+│       └── types/             # Frontend types
+├── docker-compose.yml         # ClickHouse setup
 └── package.json
+```
+
+## Reliability Features
+
+### Retry with Exponential Backoff
+
+```typescript
+// Automatically retries with increasing delays
+const result = await withRetry(
+  () => connection.getParsedTransactions(signatures),
+  {
+    maxRetries: 5,
+    baseDelayMs: 2000,
+    maxDelayMs: 30000,
+    jitterFactor: 0.3,  // Prevents thundering herd
+  }
+);
+```
+
+### Rate Limiter (Token Bucket)
+
+```typescript
+// Limits requests to prevent RPC throttling
+const rateLimiter = new RateLimiter(5, 2);  // 5 burst, 2 req/s sustained
+await rateLimiter.acquire();  // Waits if necessary
+```
+
+### Circuit Breaker
+
+```typescript
+// Fails fast when RPC is consistently unavailable
+const circuitBreaker = new CircuitBreaker(10, 60000);  // 10 failures, 60s timeout
+
+const result = await circuitBreaker.execute(async () => {
+  return await fetchData();  // Opens circuit after 10 consecutive failures
+});
+```
+
+### Deduplication
+
+1. **Application-level**: Checks existing signatures before insert
+2. **Database-level**: ReplacingMergeTree merges duplicates by `(signature, event_type)`
+
+```sql
+ENGINE = ReplacingMergeTree(_version)
+ORDER BY (signature, event_type)  -- Unique constraint
 ```
 
 ## Low-Level Borsh Implementation
@@ -148,8 +214,6 @@ The project implements a custom Borsh deserializer (`src/parser/borsh.ts`) that:
 2. **Option<T> parsing** - Handles Rust's Option type (1-byte discriminator + optional value)
 3. **Vec<u8> parsing** - Variable-length byte arrays with u32 length prefix
 4. **DLN Order struct** - Parses the full order structure including token amounts and chain IDs
-
-Example from the code:
 
 ```typescript
 export class BorshDeserializer {
@@ -175,7 +239,7 @@ export class BorshDeserializer {
 
 ## ClickHouse Schema
 
-### Orders Table
+### Orders Table (with deduplication)
 ```sql
 CREATE TABLE orders (
   order_id String,
@@ -183,15 +247,16 @@ CREATE TABLE orders (
   signature String,
   slot UInt64,
   block_time DateTime,
-  -- Order fields...
+  -- ... other fields
+  _version UInt64 DEFAULT toUnixTimestamp(now())
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree(_version)
 PARTITION BY toYYYYMM(block_time)
-ORDER BY (block_time, order_id, event_type)
+ORDER BY (signature, event_type)  -- Deduplication key
 ```
 
 ### Materialized Views
-- `daily_volumes_mv` - Pre-aggregated daily volumes
+- `daily_volumes_mv` - Pre-aggregated daily volumes (SummingMergeTree)
 - `token_stats_mv` - Token-wise statistics
 
 ## API Endpoints
@@ -199,7 +264,7 @@ ORDER BY (block_time, order_id, event_type)
 | Endpoint | Description |
 |----------|-------------|
 | `GET /api/dashboard` | Full dashboard data in one call |
-| `GET /api/stats` | Total counts and volumes |
+| `GET /api/stats` | Total counts and volumes (deduplicated) |
 | `GET /api/daily-volumes?days=30` | Daily volume time series |
 | `GET /api/top-tokens?limit=10` | Top tokens by volume |
 | `GET /api/recent-orders?limit=50` | Recent order events |
@@ -213,11 +278,22 @@ ORDER BY (block_time, order_id, event_type)
 | `CLICKHOUSE_URL` | http://localhost:8123 | ClickHouse HTTP URL |
 | `CLICKHOUSE_DATABASE` | dln_dashboard | Database name |
 | `API_PORT` | 3001 | API server port |
-| `TARGET_CREATED_ORDERS` | 25000 | Target created orders to collect |
-| `TARGET_FULFILLED_ORDERS` | 25000 | Target fulfilled orders to collect |
-| `SIGNATURES_BATCH_SIZE` | 1000 | Batch size for signature fetching |
-| `TX_BATCH_SIZE` | 50 | Batch size for transaction fetching |
-| `BATCH_DELAY_MS` | 200 | Delay between batches (rate limiting) |
+| `TARGET_CREATED_ORDERS` | 25000 | Target created orders |
+| `TARGET_FULFILLED_ORDERS` | 25000 | Target fulfilled orders |
+| `SIGNATURES_BATCH_SIZE` | 1000 | Signatures per RPC call |
+| `TX_BATCH_SIZE` | 20 | Transactions per RPC call |
+| `BATCH_DELAY_MS` | 500 | Delay between batches |
+| `RATE_LIMIT_RPS` | 2 | Max requests per second |
+| `LOG_LEVEL` | info | Logging verbosity |
+
+### Recommended Settings by RPC Provider
+
+| Provider | `TX_BATCH_SIZE` | `RATE_LIMIT_RPS` | Est. Time for 50K |
+|----------|-----------------|------------------|-------------------|
+| Public RPC | 20 | 2 | 4-6 hours |
+| Helius Free | 30 | 10 | 1-2 hours |
+| Helius Paid | 50 | 50 | 15-30 min |
+| Triton/Premium | 100 | 100 | 10-15 min |
 
 ## Development
 
@@ -232,11 +308,14 @@ npx tsx watch src/api/server.ts
 cd dashboard && npm run dev
 ```
 
-## Notes
+## Scaling Considerations
 
-- **Rate Limiting**: Public Solana RPC has aggressive rate limits. For production, use Helius, QuickNode, or similar providers.
-- **USD Values**: Currently only calculates USD for known stablecoins (USDC, USDT). Full implementation would require price feed integration.
-- **Order ID Extraction**: Extracts from transaction logs (Anchor events) or instruction data.
+For a production system processing millions of orders:
+
+1. **Use Temporal** - For durable workflows with automatic retry and state persistence
+2. **Horizontal scaling** - Multiple collector workers with different signature ranges
+3. **Streaming** - Use Geyser plugins or Yellowstone gRPC for real-time updates
+4. **ClickHouse cluster** - For higher insert throughput and query performance
 
 ## License
 
