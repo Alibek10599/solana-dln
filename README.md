@@ -66,11 +66,43 @@ A dashboard for tracking DLN (deBridge Liquidity Network) order events on Solana
 
 ## Quick Start
 
-### Prerequisites
+### Option 1: Docker (Recommended)
+
+```bash
+# Clone and enter directory
+cd dln-solana-dashboard
+
+# Create .env file with your Solana RPC URL
+echo "SOLANA_RPC_URL=https://api.mainnet-beta.solana.com" > .env
+
+# Start everything
+docker-compose up -d
+
+# Wait for services to be ready (~60 seconds)
+docker-compose logs -f temporal
+
+# Start collection workflow
+docker-compose exec worker node dist/temporal/client.js start
+
+# Watch progress
+docker-compose exec worker node dist/temporal/client.js watch
+```
+
+**Services:**
+| Service | URL | Description |
+|---------|-----|-------------|
+| Dashboard | http://localhost:3000 | React frontend |
+| API | http://localhost:3001 | Backend API |
+| Temporal UI | http://localhost:8233 | Workflow monitoring |
+| ClickHouse | http://localhost:8123 | Database |
+
+### Option 2: Local Development
+
+#### Prerequisites
 
 - Node.js 18+
-- Docker (for ClickHouse)
-- Solana RPC endpoint (public or Helius/QuickNode for better rate limits)
+- Docker (for ClickHouse and Temporal)
+- Solana RPC endpoint (public or Helius/QuickNode)
 
 ### 1. Start ClickHouse
 
@@ -310,14 +342,15 @@ cd dashboard && npm run dev
 
 ## Temporal-Based Collection (Recommended for Production)
 
-For production systems, the project includes a **Temporal-based collector** that provides:
+For production systems, the project includes a **Temporal-based collector** with:
 
-- **Durable execution** - Survives crashes and restarts
-- **Automatic retries** - Per-activity retry policies
-- **Queryable state** - Check progress anytime
+- **Child Workflows** - Parallel collection of created/fulfilled orders
+- **Separate Task Queues** - RPC activities vs DB activities for optimal resource usage
+- **Connection Pooling** - Reuses Solana connections across activities
+- **Error Classification** - Retryable vs non-retryable errors
+- **Durable Execution** - Survives crashes and restarts
+- **Queryable State** - Check progress anytime via queries
 - **Pause/Resume** - Control collection via signals
-- **Long-running support** - Uses `continueAsNew` to avoid history limits
-- **Visibility** - Full workflow history in Temporal UI
 
 ### Temporal Quick Start
 
@@ -328,14 +361,14 @@ docker-compose up -d
 # 2. Wait for Temporal to be ready (~30 seconds)
 docker-compose logs -f temporal
 
-# 3. Start the worker (in a separate terminal)
+# 3. Start the worker (handles all queues)
 npm run temporal:worker
 
 # 4. Start the collection workflow
 npm run temporal:start
 
-# 5. Check status
-npm run temporal:status
+# 5. Watch progress (auto-refresh)
+npm run temporal:watch
 
 # 6. View in Temporal UI
 open http://localhost:8233
@@ -345,70 +378,101 @@ open http://localhost:8233
 
 | Command | Description |
 |---------|-------------|
-| `npm run temporal:worker` | Start the worker (must be running) |
+| `npm run temporal:worker` | Start full worker (all queues) |
+| `npm run temporal:worker:rpc` | Start RPC-only worker |
+| `npm run temporal:worker:db` | Start DB-only worker |
 | `npm run temporal:start` | Start collection workflow |
 | `npm run temporal:status` | Check progress |
+| `npm run temporal:watch` | Watch progress (auto-refresh) |
 | `npm run temporal:pause` | Pause collection |
-| `npm run temporal:resume` | Resume paused collection |
+| `npm run temporal:resume` | Resume collection |
 | `npm run temporal:cancel` | Cancel collection |
+| `npm run temporal:health` | Run health check |
 
 ### Temporal Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Temporal Server                           │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │              collectAllOrdersWorkflow                  │  │
-│  │                                                        │  │
-│  │    ┌─────────────────────────────────────────────┐    │  │
-│  │    │         collectOrdersWorkflow (created)      │    │  │
-│  │    │  ┌──────────┐ ┌──────────┐ ┌──────────┐     │    │  │
-│  │    │  │ fetchSigs │→│ parseTxs │→│ storeEvts│     │    │  │
-│  │    │  └──────────┘ └──────────┘ └──────────┘     │    │  │
-│  │    │        ↑           ↑           ↑            │    │  │
-│  │    │        └───── Retry Policies ──┘            │    │  │
-│  │    └─────────────────────────────────────────────┘    │  │
-│  │                                                        │  │
-│  │    ┌─────────────────────────────────────────────┐    │  │
-│  │    │        collectOrdersWorkflow (fulfilled)     │    │  │
-│  │    │              (same structure)                │    │  │
-│  │    └─────────────────────────────────────────────┘    │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                                                              │
-│  Features:                                                   │
-│  ✓ Automatic checkpointing (survives crashes)               │
-│  ✓ Per-activity retry policies                              │
-│  ✓ Queryable state via signals                              │
-│  ✓ Pause/Resume capability                                  │
-│  ✓ Full history in Temporal UI                              │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           TEMPORAL SERVER                                     │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                    collectAllOrdersWorkflow (Parent)                     │ │
+│  │                              │                                           │ │
+│  │              ┌───────────────┴───────────────┐                          │ │
+│  │              ▼                               ▼                          │ │
+│  │  ┌─────────────────────────┐   ┌─────────────────────────┐              │ │
+│  │  │ collectOrdersWorkflow   │   │ collectOrdersWorkflow   │              │ │
+│  │  │ (Child: created)        │   │ (Child: fulfilled)      │              │ │
+│  │  │                         │   │                         │   PARALLEL!  │ │
+│  │  │ ┌─────┐ ┌─────┐ ┌─────┐│   │ ┌─────┐ ┌─────┐ ┌─────┐│              │ │
+│  │  │ │fetch│→│parse│→│store││   │ │fetch│→│parse│→│store││              │ │
+│  │  │ └─────┘ └─────┘ └─────┘│   │ └─────┘ └─────┘ └─────┘│              │ │
+│  │  └───────────┬─────────────┘   └───────────┬─────────────┘              │ │
+│  │              │                             │                            │ │
+│  │              └──────────────┬──────────────┘                            │ │
+│  │                             ▼                                           │ │
+│  │                      continueAsNew                                      │ │
+│  │                  (every 50 iterations)                                  │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                         TASK QUEUES                                      │ │
+│  │                                                                          │ │
+│  │   dln-collector          dln-rpc              dln-db                    │ │
+│  │   (workflows)            (RPC activities)     (DB activities)           │ │
+│  │        │                      │                    │                    │ │
+│  │        │    Rate Limited      │    High Throughput │                    │ │
+│  │        │    10 req/s          │                    │                    │ │
+│  └────────┼──────────────────────┼────────────────────┼────────────────────┘ │
+│           │                      │                    │                      │
+└───────────┼──────────────────────┼────────────────────┼──────────────────────┘
+            ▼                      ▼                    ▼
+    ┌──────────────┐       ┌──────────────┐     ┌──────────────┐
+    │   Worker 1   │       │   Worker 2   │     │   Worker 3   │
+    │  (full mode) │       │  (rpc mode)  │     │  (db mode)   │
+    │              │       │              │     │              │
+    │ All queues   │       │ RPC only     │     │ DB only      │
+    └──────────────┘       └──────────────┘     └──────────────┘
 ```
 
-### Retry Policies (Temporal Activities)
+### Activity Configuration
 
-| Activity | Timeout | Max Retries | Backoff |
-|----------|---------|-------------|----------|
-| `fetchSignaturesBatch` | 2 min | 10 | 2s → 30s |
-| `fetchAndParseTransactions` | 5 min | 5 | 3s → 60s |
-| `storeEvents` | 1 min | 5 | 1s → 10s |
-| `getProgress` | 30s | 3 | default |
+| Activity | Queue | Timeout | Max Retries | Backoff |
+|----------|-------|---------|-------------|----------|
+| `fetchSignaturesBatch` | dln-rpc | 3 min | 10 | 2s → 60s |
+| `fetchAndParseTransactions` | dln-rpc | 10 min | 5 | 5s → 2min |
+| `storeEvents` | dln-db | 1 min | 5 | 500ms → 10s |
+| `getProgress` | dln-db | 1 min | 5 | 500ms → 10s |
+| `initializeDatabase` | dln-db | 1 min | 3 | default |
 
 ### Scaling with Temporal
 
-For horizontal scaling, run multiple workers:
-
+**Development (single machine):**
 ```bash
-# Terminal 1: Worker 1
-TEMPORAL_WORKER_ID=worker-1 npm run temporal:worker
-
-# Terminal 2: Worker 2  
-TEMPORAL_WORKER_ID=worker-2 npm run temporal:worker
-
-# Terminal 3: Worker 3
-TEMPORAL_WORKER_ID=worker-3 npm run temporal:worker
+# Full worker handles everything
+npm run temporal:worker
 ```
 
-Temporal automatically distributes activities across workers.
+**Production (multiple machines):**
+```bash
+# Machine 1: Workflow coordinator + DB activities
+WORKER_MODE=full npm run temporal:worker
+
+# Machine 2-N: Dedicated RPC workers (rate limited)
+WORKER_MODE=rpc WORKER_ACTIVITIES_PER_SECOND=10 npm run temporal:worker
+
+# Machine N+1: Dedicated DB worker (high throughput)
+WORKER_MODE=db WORKER_MAX_ACTIVITIES=20 npm run temporal:worker
+```
+
+### Worker Configuration
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `WORKER_MODE` | full | Worker mode: full, rpc, db, workflow |
+| `WORKER_MAX_WORKFLOW_TASKS` | 10 | Max concurrent workflow tasks |
+| `WORKER_MAX_ACTIVITIES` | 5 | Max concurrent activities |
+| `WORKER_ACTIVITIES_PER_SECOND` | 10 | Rate limit for RPC activities |
 
 ## Comparison: Simple vs Temporal Collector
 
@@ -422,6 +486,105 @@ Temporal automatically distributes activities across workers.
 | Horizontal scaling | Manual | Built-in |
 | History/Audit | None | Full history |
 | Best for | Development, small jobs | Production, large jobs |
+
+## Docker Commands
+
+### Using docker-compose
+
+```bash
+# Build all images
+docker-compose build
+
+# Start all services
+docker-compose up -d
+
+# Start infrastructure only (for local development)
+docker-compose up -d clickhouse temporal temporal-db temporal-ui
+
+# View logs
+docker-compose logs -f api worker
+
+# Stop all services
+docker-compose down
+
+# Clean up (remove volumes)
+docker-compose down -v
+```
+
+### Using Makefile
+
+```bash
+# Start everything
+make up
+
+# Start infrastructure only
+make dev
+
+# View logs
+make logs
+
+# Start collection
+make collect
+
+# Watch progress
+make watch
+
+# Scale RPC workers
+make scale-rpc N=3
+
+# Clean up
+make clean
+```
+
+### Scaling Workers
+
+```bash
+# Start with scaled profile (includes worker-rpc and worker-db)
+docker-compose --profile scaled up -d
+
+# Scale specific worker type
+docker-compose --profile scaled up -d --scale worker-rpc=3
+
+# Or use Makefile
+make up-scaled
+make scale-rpc N=3
+```
+
+## Project Structure
+
+```
+dln-solana-dashboard/
+├── src/
+│   ├── api/
+│   │   └── server.ts          # Express API server
+│   ├── collector/
+│   │   └── index.ts           # Simple collector (non-Temporal)
+│   ├── temporal/
+│   │   ├── activities.ts      # Temporal activities
+│   │   ├── workflows.ts       # Temporal workflows
+│   │   ├── worker.ts          # Temporal worker
+│   │   └── client.ts          # CLI client
+│   ├── db/
+│   │   ├── clickhouse.ts      # Database client
+│   │   └── migrate.ts         # Schema migration
+│   ├── parser/
+│   │   ├── borsh.ts           # Low-level Borsh deserializer ⭐
+│   │   └── transaction.ts     # Transaction parsing
+│   └── utils/
+│       ├── logger.ts          # Logging
+│       └── retry.ts           # Retry utilities
+├── dashboard/
+│   ├── src/
+│   │   ├── components/        # React components
+│   │   ├── hooks/             # Custom hooks
+│   │   └── types/             # TypeScript types
+│   ├── Dockerfile             # Frontend Docker image
+│   └── nginx.conf             # Nginx configuration
+├── Dockerfile                 # Backend Docker image
+├── docker-compose.yml         # Full stack deployment
+├── Makefile                   # Convenience commands
+└── package.json
+```
 
 ## License
 

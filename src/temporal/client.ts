@@ -1,14 +1,13 @@
 /**
  * Temporal Client - Start and manage workflows
  * 
- * This script starts the collection workflow and provides
- * commands to query state, pause/resume, etc.
- * 
- * Usage:
- *   npm run temporal:start              # Start collection
- *   npm run temporal:status             # Check status
- *   npm run temporal:pause              # Pause collection
- *   npm run temporal:resume             # Resume collection
+ * Commands:
+ *   start     - Start the main collection workflow
+ *   status    - Check workflow status with child workflow details
+ *   pause     - Pause collection (sends signal to children)
+ *   resume    - Resume paused collection
+ *   cancel    - Cancel the workflow
+ *   health    - Run health check workflow
  */
 
 import 'dotenv/config';
@@ -16,185 +15,255 @@ import { Connection, Client, WorkflowExecutionAlreadyStartedError } from '@tempo
 import { 
   collectAllOrdersWorkflow,
   collectOrdersWorkflow,
+  healthCheckWorkflow,
   getCollectionState,
-  getAllOrdersState,
+  getParentState,
   pauseCollection,
   resumeCollection,
+  type CollectionState,
+  type ParentWorkflowState,
 } from './workflows.js';
 import { logger } from '../utils/logger.js';
 
+// =============================================================================
+// Configuration
+// =============================================================================
+
 const TASK_QUEUE = 'dln-collector';
-const WORKFLOW_ID_PREFIX = 'dln-collect';
+const WORKFLOW_ID = 'dln-collect-all';
+
+interface ClientConfig {
+  temporalAddress: string;
+  namespace: string;
+  targetCreated: number;
+  targetFulfilled: number;
+  parallel: boolean;
+  config: {
+    signaturesBatchSize: number;
+    txBatchSize: number;
+    batchDelayMs: number;
+  };
+}
+
+function getConfig(): ClientConfig {
+  return {
+    temporalAddress: process.env.TEMPORAL_ADDRESS || 'localhost:7233',
+    namespace: process.env.TEMPORAL_NAMESPACE || 'default',
+    targetCreated: parseInt(process.env.TARGET_CREATED_ORDERS || '25000'),
+    targetFulfilled: parseInt(process.env.TARGET_FULFILLED_ORDERS || '25000'),
+    parallel: process.env.COLLECTION_PARALLEL !== 'false',
+    config: {
+      signaturesBatchSize: parseInt(process.env.SIGNATURES_BATCH_SIZE || '1000'),
+      txBatchSize: parseInt(process.env.TX_BATCH_SIZE || '20'),
+      batchDelayMs: parseInt(process.env.BATCH_DELAY_MS || '500'),
+    },
+  };
+}
 
 async function getClient(): Promise<Client> {
+  const config = getConfig();
+  
   const connection = await Connection.connect({
-    address: process.env.TEMPORAL_ADDRESS || 'localhost:7233',
+    address: config.temporalAddress,
   });
   
   return new Client({
     connection,
-    namespace: process.env.TEMPORAL_NAMESPACE || 'default',
+    namespace: config.namespace,
   });
 }
 
-/**
- * Start the main collection workflow
- */
-async function startCollection() {
+// =============================================================================
+// Display Helpers
+// =============================================================================
+
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  
+  if (hours > 0) {
+    return `${hours}h ${minutes % 60}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds % 60}s`;
+  }
+  return `${seconds}s`;
+}
+
+function formatProgress(collected: number, target: number): string {
+  const pct = ((collected / target) * 100).toFixed(1);
+  const bar = '█'.repeat(Math.floor(Number(pct) / 5)) + '░'.repeat(20 - Math.floor(Number(pct) / 5));
+  return `${bar} ${pct}%`;
+}
+
+function printCollectionState(state: CollectionState, indent: string = '  '): void {
+  const statusEmoji = {
+    'initializing': '🔄',
+    'collecting': '📥',
+    'completed': '✅',
+    'paused': '⏸️',
+    'error': '❌',
+  }[state.status] || '❓';
+
+  console.log(`${indent}${statusEmoji} Status: ${state.status.toUpperCase()}`);
+  console.log(`${indent}   Progress: ${formatProgress(state.totalCollected, state.targetCount)}`);
+  console.log(`${indent}   Collected: ${state.totalCollected.toLocaleString()} / ${state.targetCount.toLocaleString()}`);
+  console.log(`${indent}   Inserted: ${state.eventsInserted.toLocaleString()}`);
+  console.log(`${indent}   Duplicates: ${state.duplicatesSkipped.toLocaleString()}`);
+  console.log(`${indent}   Signatures: ${state.signaturesProcessed.toLocaleString()}`);
+  console.log(`${indent}   Iterations: ${state.iterationCount}`);
+  
+  if (state.status === 'collecting' && state.eventsInserted > 0) {
+    const elapsed = (Date.now() - state.startedAt) / 1000 / 60;
+    const rate = state.eventsInserted / elapsed;
+    const remaining = state.targetCount - state.totalCollected;
+    const eta = remaining / rate;
+    console.log(`${indent}   Rate: ${rate.toFixed(1)} events/min`);
+    console.log(`${indent}   ETA: ${formatDuration(eta * 60 * 1000)}`);
+  }
+  
+  if (state.errorMessage) {
+    console.log(`${indent}   Error: ${state.errorMessage}`);
+  }
+}
+
+// =============================================================================
+// Commands
+// =============================================================================
+
+async function startCollection(): Promise<void> {
+  const config = getConfig();
   const client = await getClient();
   
-  const targetCreated = parseInt(process.env.TARGET_CREATED_ORDERS || '25000');
-  const targetFulfilled = parseInt(process.env.TARGET_FULFILLED_ORDERS || '25000');
-  const batchDelayMs = parseInt(process.env.BATCH_DELAY_MS || '500');
-  const txBatchSize = parseInt(process.env.TX_BATCH_SIZE || '20');
-  
-  const workflowId = `${WORKFLOW_ID_PREFIX}-all-orders`;
-  
-  logger.info({
-    workflowId,
-    targetCreated,
-    targetFulfilled,
-    txBatchSize,
-    batchDelayMs,
-  }, 'Starting collection workflow...');
+  console.log('\n🚀 Starting DLN Order Collection\n');
+  console.log('═'.repeat(50));
+  console.log(`Workflow ID: ${WORKFLOW_ID}`);
+  console.log(`Target Created: ${config.targetCreated.toLocaleString()}`);
+  console.log(`Target Fulfilled: ${config.targetFulfilled.toLocaleString()}`);
+  console.log(`Parallel: ${config.parallel}`);
+  console.log(`Batch Size: ${config.config.txBatchSize} txs`);
+  console.log(`Batch Delay: ${config.config.batchDelayMs}ms`);
+  console.log('═'.repeat(50));
   
   try {
     const handle = await client.workflow.start(collectAllOrdersWorkflow, {
       taskQueue: TASK_QUEUE,
-      workflowId,
+      workflowId: WORKFLOW_ID,
       args: [{
-        targetCreated,
-        targetFulfilled,
-        signaturesBatchSize: 1000,
-        txBatchSize,
-        batchDelayMs,
+        targetCreated: config.targetCreated,
+        targetFulfilled: config.targetFulfilled,
+        parallel: config.parallel,
+        config: config.config,
       }],
-      // Keep workflow history for 7 days
+      // Long timeout for collection
       workflowExecutionTimeout: '7 days',
     });
     
-    logger.info({
-      workflowId: handle.workflowId,
-      runId: handle.firstExecutionRunId,
-    }, 'Workflow started successfully!');
-    
+    console.log(`\n✅ Workflow started!`);
+    console.log(`   Run ID: ${handle.firstExecutionRunId}`);
     console.log('\n📊 Monitor progress:');
-    console.log(`   npm run temporal:status`);
-    console.log('\n🔗 Or view in Temporal UI:');
-    console.log(`   http://localhost:8233/namespaces/default/workflows/${workflowId}`);
+    console.log('   npm run temporal:status');
+    console.log('\n🌐 Temporal UI:');
+    console.log(`   http://localhost:8233/namespaces/default/workflows/${WORKFLOW_ID}`);
     
   } catch (error) {
     if (error instanceof WorkflowExecutionAlreadyStartedError) {
-      logger.warn({ workflowId }, 'Workflow already running');
-      console.log('\n⚠️  Workflow is already running. Check status:');
-      console.log(`   npm run temporal:status`);
+      console.log('\n⚠️  Workflow is already running!');
+      console.log('   Check status: npm run temporal:status');
+      console.log('   Cancel first: npm run temporal:cancel');
     } else {
       throw error;
     }
   }
 }
 
-/**
- * Start collection for a specific event type only
- */
-async function startSingleCollection(eventType: 'created' | 'fulfilled') {
+async function getStatus(): Promise<void> {
   const client = await getClient();
   
-  const programId = eventType === 'created' 
-    ? 'src5qyZHqTqecJV4aY6Cb6zDZLMDzrDKKezs22MPHr4'
-    : 'dst5MGcFPoBeREFAA5E3tU5ij8m5uVYwkzkSAbsLbNo';
-  
-  const targetKey = eventType === 'created' ? 'TARGET_CREATED_ORDERS' : 'TARGET_FULFILLED_ORDERS';
-  const targetCount = parseInt(process.env[targetKey] || '25000');
-  
-  const workflowId = `${WORKFLOW_ID_PREFIX}-${eventType}`;
+  console.log('\n📊 DLN Collection Status\n');
+  console.log('═'.repeat(60));
   
   try {
-    const handle = await client.workflow.start(collectOrdersWorkflow, {
-      taskQueue: TASK_QUEUE,
-      workflowId,
-      args: [{
-        programId,
-        eventType,
-        targetCount,
-        signaturesBatchSize: 1000,
-        txBatchSize: parseInt(process.env.TX_BATCH_SIZE || '20'),
-        batchDelayMs: parseInt(process.env.BATCH_DELAY_MS || '500'),
-      }],
-    });
-    
-    logger.info({
-      workflowId: handle.workflowId,
-      eventType,
-      targetCount,
-    }, 'Single collection workflow started');
-    
-  } catch (error) {
-    if (error instanceof WorkflowExecutionAlreadyStartedError) {
-      logger.warn({ workflowId }, 'Workflow already running');
-    } else {
-      throw error;
-    }
-  }
-}
-
-/**
- * Get status of running workflows
- */
-async function getStatus() {
-  const client = await getClient();
-  
-  // Check main workflow
-  const mainWorkflowId = `${WORKFLOW_ID_PREFIX}-all-orders`;
-  
-  try {
-    const handle = client.workflow.getHandle(mainWorkflowId);
+    // Get main workflow handle
+    const handle = client.workflow.getHandle(WORKFLOW_ID);
     const description = await handle.describe();
     
-    console.log('\n📊 DLN Collection Status\n');
-    console.log('═'.repeat(50));
-    console.log(`Workflow ID: ${mainWorkflowId}`);
+    console.log(`Workflow ID: ${WORKFLOW_ID}`);
     console.log(`Status: ${description.status.name}`);
-    console.log(`Started: ${description.startTime}`);
+    console.log(`Started: ${description.startTime?.toISOString()}`);
     
-    if (description.status.name === 'RUNNING') {
-      // Query workflow state
-      try {
-        const state = await handle.query(getAllOrdersState);
-        
-        console.log('\n📈 Progress:');
-        
-        if (state.created) {
-          const createdPct = ((state.created.totalCollected / state.created.targetCount) * 100).toFixed(1);
-          console.log(`\n  Created Orders:`);
-          console.log(`    Status: ${state.created.status}`);
-          console.log(`    Progress: ${state.created.totalCollected} / ${state.created.targetCount} (${createdPct}%)`);
-          console.log(`    Inserted: ${state.created.eventsInserted}`);
-          console.log(`    Duplicates: ${state.created.duplicatesSkipped}`);
-        }
-        
-        if (state.fulfilled) {
-          const fulfilledPct = ((state.fulfilled.totalCollected / state.fulfilled.targetCount) * 100).toFixed(1);
-          console.log(`\n  Fulfilled Orders:`);
-          console.log(`    Status: ${state.fulfilled.status}`);
-          console.log(`    Progress: ${state.fulfilled.totalCollected} / ${state.fulfilled.targetCount} (${fulfilledPct}%)`);
-          console.log(`    Inserted: ${state.fulfilled.eventsInserted}`);
-          console.log(`    Duplicates: ${state.fulfilled.duplicatesSkipped}`);
-        }
-      } catch (e) {
-        console.log('\n  (Unable to query state - workflow may be between activities)');
-      }
-    } else if (description.status.name === 'COMPLETED') {
-      console.log('\n✅ Collection completed!');
-    } else if (description.status.name === 'FAILED') {
-      console.log('\n❌ Collection failed');
+    if (description.closeTime) {
+      console.log(`Completed: ${description.closeTime.toISOString()}`);
     }
     
-    console.log('\n' + '═'.repeat(50));
+    if (description.status.name === 'RUNNING') {
+      // Query parent workflow state
+      try {
+        const parentState = await handle.query(getParentState);
+        
+        console.log('\n📦 Parent Workflow');
+        console.log(`   Status: ${parentState.status}`);
+        console.log(`   Started: ${new Date(parentState.startedAt).toISOString()}`);
+        
+        // Query child workflows
+        console.log('\n📥 Created Orders (DlnSource)');
+        if (parentState.created) {
+          printCollectionState(parentState.created);
+        } else {
+          // Try to query child directly
+          try {
+            const createdHandle = client.workflow.getHandle(`${WORKFLOW_ID}-created`);
+            const createdState = await createdHandle.query(getCollectionState);
+            printCollectionState(createdState);
+          } catch {
+            console.log('   (Child workflow not started yet)');
+          }
+        }
+        
+        console.log('\n📤 Fulfilled Orders (DlnDestination)');
+        if (parentState.fulfilled) {
+          printCollectionState(parentState.fulfilled);
+        } else {
+          try {
+            const fulfilledHandle = client.workflow.getHandle(`${WORKFLOW_ID}-fulfilled`);
+            const fulfilledState = await fulfilledHandle.query(getCollectionState);
+            printCollectionState(fulfilledState);
+          } catch {
+            console.log('   (Child workflow not started yet)');
+          }
+        }
+        
+      } catch (e) {
+        console.log('\n   (Unable to query workflow state)');
+      }
+      
+    } else if (description.status.name === 'COMPLETED') {
+      console.log('\n✅ Collection completed successfully!');
+      
+      // Try to get final result
+      try {
+        const result = await handle.result();
+        if (result.created) {
+          console.log(`\n📥 Created: ${result.created.totalCollected.toLocaleString()} orders`);
+        }
+        if (result.fulfilled) {
+          console.log(`📤 Fulfilled: ${result.fulfilled.totalCollected.toLocaleString()} orders`);
+        }
+      } catch {}
+      
+    } else if (description.status.name === 'FAILED') {
+      console.log('\n❌ Workflow failed');
+      
+    } else if (description.status.name === 'CANCELLED') {
+      console.log('\n🛑 Workflow was cancelled');
+    }
     
-  } catch (error) {
-    if ((error as any).code === 'NOT_FOUND') {
-      console.log('\n⚠️  No running workflow found.');
+    console.log('\n' + '═'.repeat(60));
+    
+  } catch (error: any) {
+    if (error.code === 'NOT_FOUND' || error.message?.includes('not found')) {
+      console.log('⚠️  No workflow found.');
       console.log('   Start one with: npm run temporal:start');
     } else {
       throw error;
@@ -202,112 +271,144 @@ async function getStatus() {
   }
 }
 
-/**
- * Pause the running workflow
- */
-async function pause() {
+async function pauseWorkflow(): Promise<void> {
   const client = await getClient();
-  const workflowId = `${WORKFLOW_ID_PREFIX}-all-orders`;
+  
+  console.log('\n⏸️  Pausing collection...');
   
   try {
-    const handle = client.workflow.getHandle(workflowId);
-    await handle.signal(pauseCollection);
+    // Pause both child workflows
+    const children = [`${WORKFLOW_ID}-created`, `${WORKFLOW_ID}-fulfilled`];
     
-    logger.info({ workflowId }, 'Pause signal sent');
-    console.log('\n⏸️  Pause signal sent. Collection will pause after current batch.');
+    for (const childId of children) {
+      try {
+        const handle = client.workflow.getHandle(childId);
+        await handle.signal(pauseCollection);
+        console.log(`   Paused: ${childId}`);
+      } catch (e: any) {
+        if (!e.message?.includes('not found')) {
+          console.log(`   Failed to pause ${childId}: ${e.message}`);
+        }
+      }
+    }
     
-  } catch (error) {
-    if ((error as any).code === 'NOT_FOUND') {
-      console.log('\n⚠️  No running workflow found.');
+    console.log('\n✅ Pause signals sent. Collection will pause after current batch.');
+    
+  } catch (error: any) {
+    if (error.code === 'NOT_FOUND') {
+      console.log('⚠️  No running workflow found.');
     } else {
       throw error;
     }
   }
 }
 
-/**
- * Resume paused workflow
- */
-async function resume() {
+async function resumeWorkflow(): Promise<void> {
   const client = await getClient();
-  const workflowId = `${WORKFLOW_ID_PREFIX}-all-orders`;
+  
+  console.log('\n▶️  Resuming collection...');
   
   try {
-    const handle = client.workflow.getHandle(workflowId);
-    await handle.signal(resumeCollection);
+    const children = [`${WORKFLOW_ID}-created`, `${WORKFLOW_ID}-fulfilled`];
     
-    logger.info({ workflowId }, 'Resume signal sent');
-    console.log('\n▶️  Resume signal sent. Collection will continue.');
+    for (const childId of children) {
+      try {
+        const handle = client.workflow.getHandle(childId);
+        await handle.signal(resumeCollection);
+        console.log(`   Resumed: ${childId}`);
+      } catch (e: any) {
+        if (!e.message?.includes('not found')) {
+          console.log(`   Failed to resume ${childId}: ${e.message}`);
+        }
+      }
+    }
     
-  } catch (error) {
-    if ((error as any).code === 'NOT_FOUND') {
-      console.log('\n⚠️  No running workflow found.');
+    console.log('\n✅ Resume signals sent. Collection will continue.');
+    
+  } catch (error: any) {
+    if (error.code === 'NOT_FOUND') {
+      console.log('⚠️  No running workflow found.');
     } else {
       throw error;
     }
   }
 }
 
-/**
- * Cancel the running workflow
- */
-async function cancel() {
+async function cancelWorkflow(): Promise<void> {
   const client = await getClient();
-  const workflowId = `${WORKFLOW_ID_PREFIX}-all-orders`;
+  
+  console.log('\n🛑 Cancelling collection...');
   
   try {
-    const handle = client.workflow.getHandle(workflowId);
+    const handle = client.workflow.getHandle(WORKFLOW_ID);
     await handle.cancel();
     
-    logger.info({ workflowId }, 'Cancel signal sent');
-    console.log('\n🛑 Cancel signal sent. Workflow will terminate.');
+    console.log('✅ Cancel signal sent. Workflow will terminate.');
     
-  } catch (error) {
-    if ((error as any).code === 'NOT_FOUND') {
-      console.log('\n⚠️  No running workflow found.');
+  } catch (error: any) {
+    if (error.code === 'NOT_FOUND' || error.message?.includes('not found')) {
+      console.log('⚠️  No running workflow found.');
     } else {
       throw error;
     }
   }
 }
 
-// CLI
-const command = process.argv[2];
+async function runHealthCheck(): Promise<void> {
+  const client = await getClient();
+  
+  console.log('\n🏥 Running health check...\n');
+  
+  try {
+    const handle = await client.workflow.start(healthCheckWorkflow, {
+      taskQueue: TASK_QUEUE,
+      workflowId: `health-check-${Date.now()}`,
+      args: [],
+    });
+    
+    const result = await handle.result();
+    
+    console.log('RPC Health:');
+    console.log(`   Status: ${result.rpc.healthy ? '✅ Healthy' : '❌ Unhealthy'}`);
+    console.log(`   Slot: ${result.rpc.slot.toLocaleString()}`);
+    console.log(`   Latency: ${result.rpc.latencyMs}ms`);
+    
+    console.log('\nDatabase Health:');
+    console.log(`   Status: ${result.db.healthy ? '✅ Healthy' : '❌ Unhealthy'}`);
+    console.log(`   Created Orders: ${result.db.counts.created.toLocaleString()}`);
+    console.log(`   Fulfilled Orders: ${result.db.counts.fulfilled.toLocaleString()}`);
+    
+  } catch (error) {
+    console.log('❌ Health check failed:', error);
+  }
+}
 
-switch (command) {
-  case 'start':
-    startCollection();
-    break;
-  case 'start-created':
-    startSingleCollection('created');
-    break;
-  case 'start-fulfilled':
-    startSingleCollection('fulfilled');
-    break;
-  case 'status':
-    getStatus();
-    break;
-  case 'pause':
-    pause();
-    break;
-  case 'resume':
-    resume();
-    break;
-  case 'cancel':
-    cancel();
-    break;
-  default:
-    console.log(`
+async function watchStatus(): Promise<void> {
+  console.log('\n👁️  Watching status (Ctrl+C to stop)...\n');
+  
+  while (true) {
+    console.clear();
+    await getStatus();
+    await new Promise(resolve => setTimeout(resolve, 5000));
+  }
+}
+
+// =============================================================================
+// CLI
+// =============================================================================
+
+function printHelp(): void {
+  console.log(`
 DLN Temporal Collector CLI
 
 Commands:
-  start           Start collecting all orders (created + fulfilled)
-  start-created   Start collecting only OrderCreated events
-  start-fulfilled Start collecting only OrderFulfilled events
-  status          Check collection status
-  pause           Pause collection
-  resume          Resume paused collection
-  cancel          Cancel collection
+  start     Start collecting all orders (created + fulfilled)
+  status    Check collection status
+  watch     Watch status with auto-refresh
+  pause     Pause collection
+  resume    Resume paused collection
+  cancel    Cancel collection
+  health    Run health check
 
 Usage:
   npx tsx src/temporal/client.ts <command>
@@ -317,5 +418,48 @@ Usage:
   npm run temporal:status
   npm run temporal:pause
   npm run temporal:resume
+  npm run temporal:cancel
+
+Environment Variables:
+  TEMPORAL_ADDRESS       Temporal server address (default: localhost:7233)
+  TEMPORAL_NAMESPACE     Temporal namespace (default: default)
+  TARGET_CREATED_ORDERS  Target created orders (default: 25000)
+  TARGET_FULFILLED_ORDERS Target fulfilled orders (default: 25000)
+  TX_BATCH_SIZE          Transactions per batch (default: 20)
+  BATCH_DELAY_MS         Delay between batches (default: 500)
+  COLLECTION_PARALLEL    Run collections in parallel (default: true)
 `);
+}
+
+const command = process.argv[2];
+
+switch (command) {
+  case 'start':
+    startCollection().catch(console.error);
+    break;
+  case 'status':
+    getStatus().catch(console.error);
+    break;
+  case 'watch':
+    watchStatus().catch(console.error);
+    break;
+  case 'pause':
+    pauseWorkflow().catch(console.error);
+    break;
+  case 'resume':
+    resumeWorkflow().catch(console.error);
+    break;
+  case 'cancel':
+    cancelWorkflow().catch(console.error);
+    break;
+  case 'health':
+    runHealthCheck().catch(console.error);
+    break;
+  case 'help':
+  case '--help':
+  case '-h':
+    printHelp();
+    break;
+  default:
+    printHelp();
 }

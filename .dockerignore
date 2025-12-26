@@ -1,0 +1,45 @@
+# Dependencies
+node_modules
+dashboard/node_modules
+
+# Build outputs
+dist
+dashboard/dist
+
+# Development files
+.git
+.gitignore
+*.md
+!README.md
+
+# Environment files (use docker-compose env instead)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Test files
+coverage
+.nyc_output
+*.test.ts
+*.spec.ts
+__tests__
+
+# Docker files (don't include in build context recursively)
+Dockerfile*
+docker-compose*.yml
+.dockerignore

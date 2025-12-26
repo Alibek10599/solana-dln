@@ -15,11 +15,15 @@
     "install:all": "npm install && cd dashboard && npm install",
     
     "temporal:worker": "tsx src/temporal/worker.ts",
+    "temporal:worker:rpc": "WORKER_MODE=rpc tsx src/temporal/worker.ts",
+    "temporal:worker:db": "WORKER_MODE=db tsx src/temporal/worker.ts",
     "temporal:start": "tsx src/temporal/client.ts start",
     "temporal:status": "tsx src/temporal/client.ts status",
+    "temporal:watch": "tsx src/temporal/client.ts watch",
     "temporal:pause": "tsx src/temporal/client.ts pause",
     "temporal:resume": "tsx src/temporal/client.ts resume",
-    "temporal:cancel": "tsx src/temporal/client.ts cancel"
+    "temporal:cancel": "tsx src/temporal/client.ts cancel",
+    "temporal:health": "tsx src/temporal/client.ts health"
   },
   "keywords": [
     "solana",

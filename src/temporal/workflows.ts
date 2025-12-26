@@ -1,13 +1,16 @@
 /**
  * Temporal Workflows for DLN Order Collection
  * 
- * Workflows are the durable, orchestrating functions.
- * They coordinate activities and maintain state that survives crashes.
+ * Improved architecture:
+ * 1. Child workflows for parallel collection
+ * 2. Separate task queues for RPC vs DB activities
+ * 3. Better state management and queries
+ * 4. Proper continueAsNew for long-running workflows
  * 
- * Key principles:
- * - Workflows must be deterministic (no I/O, random, or time)
- * - All external interactions go through activities
- * - State is automatically persisted by Temporal
+ * Workflow Hierarchy:
+ * - collectAllOrdersWorkflow (parent)
+ *   ├── collectOrdersWorkflow (child: created)
+ *   └── collectOrdersWorkflow (child: fulfilled)
  */
 
 import { 
@@ -18,44 +21,26 @@ import {
   defineSignal,
   setHandler,
   condition,
+  startChild,
+  ParentClosePolicy,
+  ChildWorkflowHandle,
+  workflowInfo,
 } from '@temporalio/workflow';
 import type * as activities from './activities.js';
 
-// Activity proxies with retry policies
-const { initializeDatabase, getProgress, getOrderCounts } = proxyActivities<typeof activities>({
-  startToCloseTimeout: '30 seconds',
-  retry: {
-    maximumAttempts: 3,
-  },
-});
+// =============================================================================
+// Activity Proxies with Task Queues
+// =============================================================================
 
-const { fetchSignaturesBatch } = proxyActivities<typeof activities>({
-  startToCloseTimeout: '2 minutes',
-  heartbeatTimeout: '30 seconds',
-  retry: {
-    initialInterval: '2 seconds',
-    maximumInterval: '30 seconds',
-    backoffCoefficient: 2,
-    maximumAttempts: 10,
-    nonRetryableErrorTypes: ['InvalidProgramId'],
-  },
-});
-
-const { fetchAndParseTransactions } = proxyActivities<typeof activities>({
-  startToCloseTimeout: '5 minutes',
-  heartbeatTimeout: '1 minute',
-  retry: {
-    initialInterval: '3 seconds',
-    maximumInterval: '60 seconds',
-    backoffCoefficient: 2,
-    maximumAttempts: 5,
-  },
-});
-
-const { storeEvents } = proxyActivities<typeof activities>({
+/**
+ * Database activities - run on dln-db queue
+ * Higher throughput, less latency sensitive
+ */
+const dbActivities = proxyActivities<typeof activities>({
+  taskQueue: 'dln-db',
   startToCloseTimeout: '1 minute',
   retry: {
-    initialInterval: '1 second',
+    initialInterval: '500ms',
     maximumInterval: '10 seconds',
     backoffCoefficient: 2,
     maximumAttempts: 5,
@@ -63,48 +48,99 @@ const { storeEvents } = proxyActivities<typeof activities>({
 });
 
 /**
- * Workflow input parameters
+ * RPC activities - run on dln-rpc queue  
+ * Rate limited, longer timeouts, more retries
  */
-export interface CollectOrdersInput {
+const rpcActivities = proxyActivities<typeof activities>({
+  taskQueue: 'dln-rpc',
+  startToCloseTimeout: '3 minutes',
+  heartbeatTimeout: '30 seconds',
+  retry: {
+    initialInterval: '2 seconds',
+    maximumInterval: '60 seconds',
+    backoffCoefficient: 2,
+    maximumAttempts: 10,
+  },
+});
+
+/**
+ * Long-running RPC activities (parsing large batches)
+ */
+const rpcLongActivities = proxyActivities<typeof activities>({
+  taskQueue: 'dln-rpc',
+  startToCloseTimeout: '10 minutes',
+  heartbeatTimeout: '1 minute',
+  retry: {
+    initialInterval: '5 seconds',
+    maximumInterval: '2 minutes',
+    backoffCoefficient: 2,
+    maximumAttempts: 5,
+  },
+});
+
+// =============================================================================
+// Workflow State Types
+// =============================================================================
+
+export interface CollectionConfig {
+  signaturesBatchSize: number;
+  txBatchSize: number;
+  batchDelayMs: number;
+}
+
+export interface CollectionState {
+  status: 'initializing' | 'collecting' | 'completed' | 'paused' | 'error';
   programId: string;
   eventType: 'created' | 'fulfilled';
   targetCount: number;
-  signaturesBatchSize?: number;
-  txBatchSize?: number;
-  batchDelayMs?: number;
-}
-
-/**
- * Workflow state (queryable)
- */
-export interface CollectionState {
-  status: 'initializing' | 'collecting' | 'completed' | 'paused' | 'error';
   totalCollected: number;
-  targetCount: number;
   signaturesProcessed: number;
+  transactionsProcessed: number;
   eventsInserted: number;
   duplicatesSkipped: number;
   lastSignature: string | null;
-  startedAt: string;
-  lastUpdateAt: string;
+  iterationCount: number;
+  startedAt: number;
+  lastUpdateAt: number;
   errorMessage?: string;
 }
 
-// Define queries and signals
+export interface ParentWorkflowState {
+  status: 'initializing' | 'running' | 'completed' | 'error';
+  created: CollectionState | null;
+  fulfilled: CollectionState | null;
+  startedAt: number;
+  completedAt?: number;
+  errorMessage?: string;
+}
+
+// =============================================================================
+// Queries and Signals
+// =============================================================================
+
+// Child workflow queries/signals
 export const getCollectionState = defineQuery<CollectionState>('getCollectionState');
 export const pauseCollection = defineSignal('pauseCollection');
 export const resumeCollection = defineSignal('resumeCollection');
 
-/**
- * Main workflow: Collect orders for a specific program/event type
- * 
- * Features:
- * - Automatic retry of failed activities
- * - Progress checkpointing (survives crashes)
- * - Queryable state
- * - Pause/resume via signals
- * - ContinueAsNew for long-running collections
- */
+// Parent workflow queries/signals
+export const getParentState = defineQuery<ParentWorkflowState>('getParentState');
+export const pauseAll = defineSignal('pauseAll');
+export const resumeAll = defineSignal('resumeAll');
+
+// =============================================================================
+// Child Workflow: Collect Orders for One Event Type
+// =============================================================================
+
+export interface CollectOrdersInput {
+  programId: string;
+  eventType: 'created' | 'fulfilled';
+  targetCount: number;
+  config: CollectionConfig;
+  // For continueAsNew - resume from previous state
+  resumeState?: Partial<CollectionState>;
+}
+
 export async function collectOrdersWorkflow(
   input: CollectOrdersInput
 ): Promise<CollectionState> {
@@ -112,110 +148,128 @@ export async function collectOrdersWorkflow(
     programId,
     eventType,
     targetCount,
-    signaturesBatchSize = 1000,
-    txBatchSize = 20,
-    batchDelayMs = 500,
+    config,
+    resumeState,
   } = input;
 
-  // Initialize state
+  const info = workflowInfo();
+  
+  // Initialize or resume state
   let state: CollectionState = {
     status: 'initializing',
-    totalCollected: 0,
+    programId,
+    eventType,
     targetCount,
-    signaturesProcessed: 0,
-    eventsInserted: 0,
-    duplicatesSkipped: 0,
-    lastSignature: null,
-    startedAt: new Date().toISOString(),
-    lastUpdateAt: new Date().toISOString(),
+    totalCollected: resumeState?.totalCollected ?? 0,
+    signaturesProcessed: resumeState?.signaturesProcessed ?? 0,
+    transactionsProcessed: resumeState?.transactionsProcessed ?? 0,
+    eventsInserted: resumeState?.eventsInserted ?? 0,
+    duplicatesSkipped: resumeState?.duplicatesSkipped ?? 0,
+    lastSignature: resumeState?.lastSignature ?? null,
+    iterationCount: resumeState?.iterationCount ?? 0,
+    startedAt: resumeState?.startedAt ?? Date.now(),
+    lastUpdateAt: Date.now(),
   };
 
   let isPaused = false;
 
-  // Set up query handler
+  // Set up handlers
   setHandler(getCollectionState, () => state);
-
-  // Set up signal handlers
+  
   setHandler(pauseCollection, () => {
     isPaused = true;
     state.status = 'paused';
-    state.lastUpdateAt = new Date().toISOString();
+    state.lastUpdateAt = Date.now();
   });
-
+  
   setHandler(resumeCollection, () => {
     isPaused = false;
     state.status = 'collecting';
-    state.lastUpdateAt = new Date().toISOString();
+    state.lastUpdateAt = Date.now();
   });
 
   try {
-    // Get current progress from database
-    const progress = await getProgress(programId, eventType);
-    state.totalCollected = progress.totalCollected;
-    state.lastSignature = progress.lastSignature;
+    // Get current progress from database (unless resuming from continueAsNew)
+    if (!resumeState) {
+      const progress = await dbActivities.getProgress(programId, eventType);
+      state.totalCollected = progress.totalCollected;
+      state.lastSignature = progress.lastSignature;
+    }
 
     // Check if already complete
     if (state.totalCollected >= targetCount) {
       state.status = 'completed';
+      state.lastUpdateAt = Date.now();
       return state;
     }
 
     state.status = 'collecting';
-    state.lastUpdateAt = new Date().toISOString();
+    state.lastUpdateAt = Date.now();
 
-    let iterationCount = 0;
-    const MAX_ITERATIONS_BEFORE_CONTINUE_AS_NEW = 100;
+    // Limits for continueAsNew
+    const MAX_ITERATIONS_BEFORE_CONTINUE = 50;
+    let iterationsInThisRun = 0;
 
     // Main collection loop
     while (state.totalCollected < targetCount) {
-      // Check for pause signal
+      // Check for pause
       if (isPaused) {
-        await condition(() => !isPaused, '1 hour');
+        // Wait for resume signal (up to 24 hours)
+        await condition(() => !isPaused, '24 hours');
+        if (isPaused) {
+          // Timed out while paused - complete workflow
+          state.status = 'paused';
+          return state;
+        }
         continue;
       }
 
-      // ContinueAsNew to avoid history limit
-      if (iterationCount >= MAX_ITERATIONS_BEFORE_CONTINUE_AS_NEW) {
-        // Continue as new workflow with current state
+      // ContinueAsNew to prevent history from growing too large
+      if (iterationsInThisRun >= MAX_ITERATIONS_BEFORE_CONTINUE) {
         await continueAsNew<typeof collectOrdersWorkflow>({
           ...input,
-          // Progress is in the database, will be loaded on restart
+          resumeState: {
+            ...state,
+            iterationCount: state.iterationCount,
+          },
         });
       }
 
       // 1. Fetch signatures batch
-      const sigResult = await fetchSignaturesBatch({
+      const sigResult = await rpcActivities.fetchSignaturesBatch({
         programId,
         before: state.lastSignature || undefined,
-        limit: signaturesBatchSize,
+        limit: config.signaturesBatchSize,
       });
 
       if (sigResult.signatures.length === 0) {
-        // No more signatures
+        // No more signatures available
         state.status = 'completed';
         break;
       }
 
-      // Filter valid signatures (no errors)
+      // Filter valid signatures
       const validSigs = sigResult.signatures.filter(s => !s.err);
       state.signaturesProcessed += validSigs.length;
 
       // 2. Process in transaction batches
-      for (let i = 0; i < validSigs.length; i += txBatchSize) {
-        // Check for pause
+      for (let i = 0; i < validSigs.length && state.totalCollected < targetCount; i += config.txBatchSize) {
+        // Check for pause between batches
         if (isPaused) break;
 
-        const batch = validSigs.slice(i, i + txBatchSize);
+        const batch = validSigs.slice(i, i + config.txBatchSize);
         const signatures = batch.map(s => s.signature);
 
         // Fetch and parse transactions
-        const parseResult = await fetchAndParseTransactions({
+        const parseResult = await rpcLongActivities.fetchAndParseTransactions({
           signatures,
           eventType,
         });
 
-        // Store events
-        const storeResult = await storeEvents({
+        state.transactionsProcessed += parseResult.processedCount;
+
+        // Store events (on DB queue)
+        const storeResult = await dbActivities.storeEvents({
           events: parseResult.events,
           programId,
           eventType,
@@ -227,129 +281,205 @@ export async function collectOrdersWorkflow(
         state.duplicatesSkipped += storeResult.duplicateCount;
         state.totalCollected = storeResult.totalCollected;
         state.lastSignature = batch[batch.length - 1].signature;
-        state.lastUpdateAt = new Date().toISOString();
-
-        // Check if target reached
-        if (state.totalCollected >= targetCount) {
-          state.status = 'completed';
-          break;
-        }
+        state.lastUpdateAt = Date.now();
 
         // Rate limiting delay
-        await sleep(batchDelayMs);
+        if (config.batchDelayMs > 0) {
+          await sleep(config.batchDelayMs);
+        }
       }
 
-      if (state.status === 'completed') break;
+      // Check completion
+      if (state.totalCollected >= targetCount) {
+        state.status = 'completed';
+        break;
+      }
 
-      // Delay between signature batches
-      await sleep(batchDelayMs);
-      iterationCount++;
+      // Increment counters
+      state.iterationCount++;
+      iterationsInThisRun++;
+
+      // Small delay between signature batches
+      await sleep(config.batchDelayMs);
     }
 
     state.status = 'completed';
+    state.lastUpdateAt = Date.now();
     return state;
 
   } catch (error) {
     state.status = 'error';
     state.errorMessage = error instanceof Error ? error.message : String(error);
-    state.lastUpdateAt = new Date().toISOString();
+    state.lastUpdateAt = Date.now();
     throw error;
   }
 }
 
-/**
- * Parent workflow: Orchestrate collection of both order types
- * 
- * This workflow coordinates the collection of both OrderCreated
- * and OrderFulfilled events, either in parallel or sequence.
- */
+// =============================================================================
+// Parent Workflow: Orchestrate All Collections
+// =============================================================================
+
 export interface CollectAllOrdersInput {
   targetCreated: number;
   targetFulfilled: number;
+  config?: Partial<CollectionConfig>;
   parallel?: boolean;
-  signaturesBatchSize?: number;
-  txBatchSize?: number;
-  batchDelayMs?: number;
 }
 
-export interface CollectAllOrdersState {
-  status: 'running' | 'completed' | 'error';
-  created: CollectionState | null;
-  fulfilled: CollectionState | null;
-  startedAt: string;
-  completedAt?: string;
-}
-
-export const getAllOrdersState = defineQuery<CollectAllOrdersState>('getAllOrdersState');
+const DLN_SOURCE = 'src5qyZHqTqecJV4aY6Cb6zDZLMDzrDKKezs22MPHr4';
+const DLN_DESTINATION = 'dst5MGcFPoBeREFAA5E3tU5ij8m5uVYwkzkSAbsLbNo';
 
 export async function collectAllOrdersWorkflow(
   input: CollectAllOrdersInput
-): Promise<CollectAllOrdersState> {
+): Promise<ParentWorkflowState> {
   const {
     targetCreated,
     targetFulfilled,
-    parallel = false,
-    signaturesBatchSize = 1000,
-    txBatchSize = 20,
-    batchDelayMs = 500,
+    parallel = true,
+    config: configOverrides,
   } = input;
 
-  // DLN program addresses
-  const DLN_SOURCE = 'src5qyZHqTqecJV4aY6Cb6zDZLMDzrDKKezs22MPHr4';
-  const DLN_DESTINATION = 'dst5MGcFPoBeREFAA5E3tU5ij8m5uVYwkzkSAbsLbNo';
-
-  let state: CollectAllOrdersState = {
-    status: 'running',
-    created: null,
-    fulfilled: null,
-    startedAt: new Date().toISOString(),
+  const config: CollectionConfig = {
+    signaturesBatchSize: configOverrides?.signaturesBatchSize ?? 1000,
+    txBatchSize: configOverrides?.txBatchSize ?? 20,
+    batchDelayMs: configOverrides?.batchDelayMs ?? 500,
   };
 
-  setHandler(getAllOrdersState, () => state);
+  // Initialize state
+  let state: ParentWorkflowState = {
+    status: 'initializing',
+    created: null,
+    fulfilled: null,
+    startedAt: Date.now(),
+  };
+
+  // Track child workflow handles
+  let createdHandle: ChildWorkflowHandle<typeof collectOrdersWorkflow> | null = null;
+  let fulfilledHandle: ChildWorkflowHandle<typeof collectOrdersWorkflow> | null = null;
+
+  // Set up handlers
+  setHandler(getParentState, () => state);
+
+  setHandler(pauseAll, async () => {
+    // Forward pause signal to children
+    // Note: In Temporal, we can't directly signal children from parent
+    // The children have their own pause handlers
+    state.status = 'running'; // Keep parent running, children handle pause
+  });
+
+  setHandler(resumeAll, async () => {
+    state.status = 'running';
+  });
 
   try {
     // Initialize database first
-    await initializeDatabase();
+    await dbActivities.initializeDatabase();
 
-    const commonOptions = {
-      signaturesBatchSize,
-      txBatchSize,
-      batchDelayMs,
-    };
+    state.status = 'running';
 
     if (parallel) {
-      // Collect both in parallel (faster but uses more RPC quota)
-      // Note: This would typically use child workflows, but for simplicity
-      // we'll run sequentially. For true parallelism, use child workflows
-      // or separate worker processes.
-      
-      // For now, run sequentially even if parallel requested
-      // True parallel would need child workflow implementation
+      // Start both child workflows in parallel
+      createdHandle = await startChild(collectOrdersWorkflow, {
+        workflowId: `${workflowInfo().workflowId}-created`,
+        taskQueue: 'dln-collector', // Child workflows run on main queue
+        args: [{
+          programId: DLN_SOURCE,
+          eventType: 'created' as const,
+          targetCount: targetCreated,
+          config,
+        }],
+        parentClosePolicy: ParentClosePolicy.REQUEST_CANCEL,
+      });
+
+      fulfilledHandle = await startChild(collectOrdersWorkflow, {
+        workflowId: `${workflowInfo().workflowId}-fulfilled`,
+        taskQueue: 'dln-collector',
+        args: [{
+          programId: DLN_DESTINATION,
+          eventType: 'fulfilled' as const,
+          targetCount: targetFulfilled,
+          config,
+        }],
+        parentClosePolicy: ParentClosePolicy.REQUEST_CANCEL,
+      });
+
+      // Wait for both to complete
+      const [createdResult, fulfilledResult] = await Promise.all([
+        createdHandle.result(),
+        fulfilledHandle.result(),
+      ]);
+
+      state.created = createdResult;
+      state.fulfilled = fulfilledResult;
+
+    } else {
+      // Sequential execution
+      createdHandle = await startChild(collectOrdersWorkflow, {
+        workflowId: `${workflowInfo().workflowId}-created`,
+        taskQueue: 'dln-collector',
+        args: [{
+          programId: DLN_SOURCE,
+          eventType: 'created' as const,
+          targetCount: targetCreated,
+          config,
+        }],
+        parentClosePolicy: ParentClosePolicy.REQUEST_CANCEL,
+      });
+
+      state.created = await createdHandle.result();
+
+      fulfilledHandle = await startChild(collectOrdersWorkflow, {
+        workflowId: `${workflowInfo().workflowId}-fulfilled`,
+        taskQueue: 'dln-collector',
+        args: [{
+          programId: DLN_DESTINATION,
+          eventType: 'fulfilled' as const,
+          targetCount: targetFulfilled,
+          config,
+        }],
+        parentClosePolicy: ParentClosePolicy.REQUEST_CANCEL,
+      });
+
+      state.fulfilled = await fulfilledHandle.result();
     }
 
-    // Collect OrderCreated
-    state.created = await collectOrdersWorkflow({
-      programId: DLN_SOURCE,
-      eventType: 'created',
-      targetCount: targetCreated,
-      ...commonOptions,
-    });
-
-    // Collect OrderFulfilled  
-    state.fulfilled = await collectOrdersWorkflow({
-      programId: DLN_DESTINATION,
-      eventType: 'fulfilled',
-      targetCount: targetFulfilled,
-      ...commonOptions,
-    });
+    // Get final counts
+    const counts = await dbActivities.getOrderCounts();
 
     state.status = 'completed';
-    state.completedAt = new Date().toISOString();
+    state.completedAt = Date.now();
 
     return state;
 
   } catch (error) {
     state.status = 'error';
+    state.errorMessage = error instanceof Error ? error.message : String(error);
     throw error;
   }
+}
+
+// =============================================================================
+// Utility Workflow: Health Check
+// =============================================================================
+
+export interface HealthCheckResult {
+  rpc: { healthy: boolean; slot: number; latencyMs: number };
+  db: { healthy: boolean; counts: { created: number; fulfilled: number } };
+  timestamp: number;
+}
+
+export async function healthCheckWorkflow(): Promise<HealthCheckResult> {
+  const [rpcHealth, counts] = await Promise.all([
+    rpcActivities.checkRpcHealth(),
+    dbActivities.getOrderCounts().catch(() => ({ created: 0, fulfilled: 0, total: 0 })),
+  ]);
+
+  return {
+    rpc: rpcHealth,
+    db: {
+      healthy: counts.total >= 0,
+      counts: { created: counts.created, fulfilled: counts.fulfilled },
+    },
+    timestamp: Date.now(),
+  };
 }

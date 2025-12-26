@@ -1,23 +1,39 @@
+# =============================================================================
+# DLN Solana Dashboard - Docker Compose
+# =============================================================================
+# 
+# All environment variables are loaded from .env file
+# Copy .env.example to .env and configure before running
+#
+# Usage:
+#   docker-compose up -d              # Start all services
+#   docker-compose --profile scaled up -d  # Start with scaled workers
+#   docker-compose logs -f            # View logs
+#
+# =============================================================================
+
 version: '3.8'
 
 services:
-  # ============================================================
+  # ===========================================================================
+  # Infrastructure Services
+  # ===========================================================================
+  
   # ClickHouse - Analytics Database
-  # ============================================================
   clickhouse:
     image: clickhouse/clickhouse-server:24.3
     container_name: dln-clickhouse
     ports:
-      - "8123:8123"  # HTTP interface
-      - "9000:9000"  # Native client
+      - "${CLICKHOUSE_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - clickhouse-logs:/var/log/clickhouse-server
     environment:
-      - CLICKHOUSE_DB=dln_dashboard
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=
-      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-dln_dashboard}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ulimits:
       nofile:
         soft: 262144
@@ -27,26 +43,40 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    networks:
+      - dln-network
 
-  # ============================================================
-  # Temporal - Durable Workflow Engine
-  # ============================================================
-  # Using the auto-setup image which includes:
-  # - Temporal server
-  # - PostgreSQL for persistence
-  # - Elasticsearch for visibility (optional)
+  # Temporal Database (PostgreSQL)
+  temporal-db:
+    image: postgres:15-alpine
+    container_name: dln-temporal-db
+    environment:
+      POSTGRES_USER: ${TEMPORAL_DB_USER:-temporal}
+      POSTGRES_PASSWORD: ${TEMPORAL_DB_PASSWORD:-temporal}
+      POSTGRES_DB: ${TEMPORAL_DB_NAME:-temporal}
+    volumes:
+      - temporal-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TEMPORAL_DB_USER:-temporal}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - dln-network
+
+  # Temporal Server
   temporal:
-    image: temporalio/auto-setup:1.24
+    image: temporalio/auto-setup:${TEMPORAL_VERSION:-1.24}
     container_name: dln-temporal
     ports:
-      - "7233:7233"  # gRPC frontend
+      - "${TEMPORAL_PORT:-7233}:7233"
     environment:
-      - DB=postgres12
-      - DB_PORT=5432
-      - POSTGRES_USER=temporal
-      - POSTGRES_PWD=temporal
-      - POSTGRES_SEEDS=temporal-db
-      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: ${TEMPORAL_DB_USER:-temporal}
+      POSTGRES_PWD: ${TEMPORAL_DB_PASSWORD:-temporal}
+      POSTGRES_SEEDS: temporal-db
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
     depends_on:
       temporal-db:
         condition: service_healthy
@@ -56,52 +86,181 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
-
-  temporal-db:
-    image: postgres:15
-    container_name: dln-temporal-db
-    ports:
-      - "5433:5432"  # Different port to avoid conflicts
-    environment:
-      - POSTGRES_USER=temporal
-      - POSTGRES_PASSWORD=temporal
-      - POSTGRES_DB=temporal
-    volumes:
-      - temporal-db-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U temporal"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+    networks:
+      - dln-network
 
   # Temporal Web UI
   temporal-ui:
-    image: temporalio/ui:2.26.2
+    image: temporalio/ui:${TEMPORAL_UI_VERSION:-2.26.2}
     container_name: dln-temporal-ui
     ports:
-      - "8233:8080"  # Web UI
+      - "${TEMPORAL_UI_PORT:-8233}:8080"
     environment:
-      - TEMPORAL_ADDRESS=temporal:7233
-      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000,http://localhost:8080
     depends_on:
       - temporal
+    networks:
+      - dln-network
 
-  # ============================================================
-  # Temporal Admin Tools (optional, for debugging)
-  # ============================================================
+  # ===========================================================================
+  # Application Services
+  # ===========================================================================
+
+  # Backend API Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dln-api
+    ports:
+      - "${API_PORT:-3001}:3001"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      API_PORT: 3001
+      # Override for Docker networking
+      CLICKHOUSE_URL: http://clickhouse:8123
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - dln-network
+
+  # Temporal Worker (Full Mode)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dln-worker
+    command: ["node", "dist/temporal/worker.js"]
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      WORKER_MODE: ${WORKER_MODE:-full}
+      # Override for Docker networking
+      TEMPORAL_ADDRESS: temporal:7233
+      CLICKHOUSE_URL: http://clickhouse:8123
+    depends_on:
+      temporal:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - dln-network
+
+  # React Dashboard (Nginx)
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api
+    container_name: dln-dashboard
+    ports:
+      - "${DASHBOARD_PORT:-3000}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - dln-network
+
+  # ===========================================================================
+  # Optional: Specialized Workers (for scaling)
+  # ===========================================================================
+
+  # RPC Worker (rate-limited Solana operations)
+  worker-rpc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "dist/temporal/worker.js"]
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      WORKER_MODE: rpc
+      TEMPORAL_ADDRESS: temporal:7233
+      WORKER_MAX_ACTIVITIES: ${WORKER_RPC_MAX_ACTIVITIES:-3}
+      WORKER_ACTIVITIES_PER_SECOND: ${WORKER_RPC_RATE_LIMIT:-5}
+    depends_on:
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - dln-network
+    profiles:
+      - scaled
+
+  # DB Worker (high-throughput database operations)
+  worker-db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "dist/temporal/worker.js"]
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      WORKER_MODE: db
+      TEMPORAL_ADDRESS: temporal:7233
+      CLICKHOUSE_URL: http://clickhouse:8123
+      WORKER_MAX_ACTIVITIES: ${WORKER_DB_MAX_ACTIVITIES:-20}
+    depends_on:
+      temporal:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - dln-network
+    profiles:
+      - scaled
+
+  # ===========================================================================
+  # Optional: Admin Tools
+  # ===========================================================================
+  
   temporal-admin-tools:
-    image: temporalio/admin-tools:1.24
+    image: temporalio/admin-tools:${TEMPORAL_VERSION:-1.24}
     container_name: dln-temporal-admin
     stdin_open: true
     tty: true
     environment:
-      - TEMPORAL_ADDRESS=temporal:7233
+      TEMPORAL_ADDRESS: temporal:7233
     depends_on:
       - temporal
+    networks:
+      - dln-network
     profiles:
-      - tools  # Only start with: docker-compose --profile tools up
+      - tools
 
+# =============================================================================
+# Volumes
+# =============================================================================
 volumes:
   clickhouse-data:
   clickhouse-logs:
   temporal-db-data:
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  dln-network:
+    driver: bridge
