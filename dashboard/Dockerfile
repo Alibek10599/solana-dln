@@ -11,8 +11,8 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies (use npm install since package-lock.json may not exist)
+RUN npm install
 
 # Copy source files
 COPY . .

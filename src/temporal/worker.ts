@@ -13,7 +13,7 @@
  */
 
 import 'dotenv/config';
-import { Worker, NativeConnection, Runtime } from '@temporalio/worker';
+import { Worker, NativeConnection } from '@temporalio/worker';
 import * as activities from './activities.js';
 import { logger } from '../utils/logger.js';
 
@@ -146,20 +146,6 @@ async function run() {
     namespace: config.namespace,
     taskQueues: config.taskQueues,
   }, 'Starting Temporal worker');
-
-  // Configure runtime (optional: for metrics, logging, etc.)
-  Runtime.install({
-    logger: {
-      // Forward Temporal logs to our logger
-      log: (level, message, meta) => {
-        const logMethod = level === 'ERROR' ? 'error' 
-          : level === 'WARN' ? 'warn' 
-          : level === 'INFO' ? 'info' 
-          : 'debug';
-        logger[logMethod]({ ...meta }, message);
-      },
-    },
-  });
 
   // Connect to Temporal server
   const connection = await NativeConnection.connect({

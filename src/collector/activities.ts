@@ -87,7 +87,7 @@ export async function fetchSignatures(input: FetchSignaturesInput): Promise<Fetc
     signatures: signatures.map(s => ({
       signature: s.signature,
       slot: s.slot,
-      blockTime: s.blockTime,
+      blockTime: s.blockTime ?? null,
       err: s.err !== null,
     })),
     hasMore: signatures.length === input.limit,

@@ -98,7 +98,7 @@ async function parseSourceInstruction(
       return null;
     }
     
-    const data = bs58.decode(ix.data);
+    const data = Buffer.from(bs58.decode(ix.data));
     
     // Need at least 8 bytes for discriminator
     if (data.length < 8) {
@@ -144,7 +144,7 @@ async function parseSourceInstruction(
       signature,
       slot,
       block_time: blockTime,
-      maker,
+      maker: maker || undefined,
       give_token_address: orderData.giveTokenAddress,
       give_token_symbol: giveTokenSymbol,
       give_amount: orderData.giveAmount,
@@ -178,7 +178,7 @@ async function parseDestinationInstruction(
       return null;
     }
     
-    const data = bs58.decode(ix.data);
+    const data = Buffer.from(bs58.decode(ix.data));
     
     if (data.length < 8) {
       return null;
@@ -208,7 +208,7 @@ async function parseDestinationInstruction(
       signature,
       slot,
       block_time: blockTime,
-      taker,
+      taker: taker || undefined,
       // USD values would need to be calculated from transfer instructions
       // or cross-referenced with the created order
     };

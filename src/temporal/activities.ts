@@ -328,7 +328,7 @@ export async function fetchSignaturesBatch(
     const signatures: SignatureInfo[] = rawSignatures.map(s => ({
       signature: s.signature,
       slot: s.slot,
-      blockTime: s.blockTime,
+      blockTime: s.blockTime ?? null,
       err: s.err !== null,
     }));
     

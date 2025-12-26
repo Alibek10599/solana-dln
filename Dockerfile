@@ -19,8 +19,8 @@ FROM base AS deps
 # Copy package files
 COPY package*.json ./
 
-# Install all dependencies (including dev for build)
-RUN npm ci
+# Install all dependencies (use npm install since package-lock.json may not exist)
+RUN npm install
 
 # =============================================================================
 # Build stage
