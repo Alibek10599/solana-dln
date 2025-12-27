@@ -76,7 +76,7 @@ install:
 
 # Start infrastructure only (ClickHouse, Temporal)
 dev:
-	docker-compose up -d clickhouse temporal temporal-db temporal-ui
+	docker compose up -d clickhouse temporal temporal-db temporal-ui
 	@echo ""
 	@echo "✅ Infrastructure started!"
 	@echo ""
@@ -98,12 +98,12 @@ infra: dev
 
 # Build all images
 build: env-check
-	docker-compose build
+	docker compose build
 	@echo "✅ Images built"
 
 # Start all services
 up: env-check
-	docker-compose up -d
+	docker compose up -d
 	@echo ""
 	@echo "✅ All services started!"
 	@echo ""
@@ -119,12 +119,12 @@ up: env-check
 
 # Start with scaled workers
 up-scaled: env-check
-	docker-compose --profile scaled up -d
+	docker compose --profile scaled up -d
 	@echo "✅ Started with scaled workers"
 
 # Stop all services
 down:
-	docker-compose --profile scaled --profile tools down
+	docker compose --profile scaled --profile tools down
 	@echo "✅ All services stopped"
 
 # Restart all services
@@ -132,23 +132,23 @@ restart: down up
 
 # Follow logs
 logs:
-	docker-compose logs -f
+	docker compose logs -f
 
 logs-api:
-	docker-compose logs -f api
+	docker compose logs -f api
 
 logs-worker:
-	docker-compose logs -f worker
+	docker compose logs -f worker
 
 logs-all-workers:
-	docker-compose --profile scaled logs -f worker worker-rpc worker-db
+	docker compose --profile scaled logs -f worker worker-rpc worker-db
 
 # Scale RPC workers
 scale-rpc: env-check
 ifndef N
 	$(error N is not set. Usage: make scale-rpc N=3)
 endif
-	docker-compose --profile scaled up -d --scale worker-rpc=$(N)
+	docker compose --profile scaled up -d --scale worker-rpc=$(N)
 	@echo "✅ Scaled RPC workers to $(N) instances"
 
 # =============================================================================
@@ -157,36 +157,36 @@ endif
 
 # Initialize database (run migrations)
 migrate: env-check
-	docker-compose exec api node dist/db/migrate.js
+	docker compose exec api node dist/db/migrate.js
 	@echo "✅ Database migrated"
 
 # Start collection workflow
 collect: env-check
-	docker-compose exec worker node dist/temporal/client.js start
+	docker compose exec worker node dist/temporal/client.js start
 
 # Check status
 status: env-check
-	docker-compose exec worker node dist/temporal/client.js status
+	docker compose exec worker node dist/temporal/client.js status
 
 # Watch progress
 watch: env-check
-	docker-compose exec worker node dist/temporal/client.js watch
+	docker compose exec worker node dist/temporal/client.js watch
 
 # Pause collection
 pause: env-check
-	docker-compose exec worker node dist/temporal/client.js pause
+	docker compose exec worker node dist/temporal/client.js pause
 
 # Resume collection
 resume: env-check
-	docker-compose exec worker node dist/temporal/client.js resume
+	docker compose exec worker node dist/temporal/client.js resume
 
 # Cancel collection
 cancel: env-check
-	docker-compose exec worker node dist/temporal/client.js cancel
+	docker compose exec worker node dist/temporal/client.js cancel
 
 # Health check
 health: env-check
-	docker-compose exec worker node dist/temporal/client.js health
+	docker compose exec worker node dist/temporal/client.js health
 
 # =============================================================================
 # Maintenance
@@ -194,23 +194,23 @@ health: env-check
 
 # Clean up everything
 clean:
-	docker-compose --profile scaled --profile tools down -v
+	docker compose --profile scaled --profile tools down -v
 	docker system prune -f
 	@echo "✅ Cleaned up containers and volumes"
 
 # Shell access
 shell-api:
-	docker-compose exec api sh
+	docker compose exec api sh
 
 shell-worker:
-	docker-compose exec worker sh
+	docker compose exec worker sh
 
 shell-clickhouse:
-	docker-compose exec clickhouse clickhouse-client
+	docker compose exec clickhouse clickhouse-client
 
 # Temporal admin tools
 temporal-admin:
-	docker-compose --profile tools run --rm temporal-admin-tools
+	docker compose --profile tools run --rm temporal-admin-tools
 
 # =============================================================================
 # Local Development (without Docker for app, with Docker for infra)

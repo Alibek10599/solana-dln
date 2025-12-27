@@ -4,10 +4,10 @@
 # Multi-stage build for smaller production image
 # Includes: API server, Collector, Temporal worker
 
-FROM node:20-alpine AS base
+FROM node:20-slim AS base
 
 # Install dependencies for native modules
-RUN apk add --no-cache python3 make g++
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -39,13 +39,16 @@ RUN npm run build
 # =============================================================================
 # Production stage
 # =============================================================================
-FROM node:20-alpine AS production
+FROM node:20-slim AS production
 
 WORKDIR /app
 
+# Install wget for healthcheck
+RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
+
 # Create non-root user for security
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001
+RUN groupadd -g 1001 nodejs && \
+    useradd -r -u 1001 -g nodejs nodejs
 
 # Copy built files and production dependencies
 COPY --from=builder /app/dist ./dist

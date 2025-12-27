@@ -111,14 +111,15 @@ export const SCHEMA = {
   tokenStatsMV: `
     CREATE MATERIALIZED VIEW IF NOT EXISTS token_stats_mv
     ENGINE = SummingMergeTree()
-    ORDER BY (give_token_symbol)
+    PARTITION BY tuple()
+    ORDER BY (symbol)
     AS SELECT
-      give_token_symbol,
+      assumeNotNull(give_token_symbol) AS symbol,
       count() AS order_count,
       sum(give_amount_usd) AS volume_usd
     FROM orders
     WHERE event_type = 'created' AND give_token_symbol IS NOT NULL
-    GROUP BY give_token_symbol
+    GROUP BY symbol
   `,
 
   /**
@@ -479,23 +480,23 @@ export interface TokenStat {
 
 export async function getTopTokens(limit: number = 10): Promise<TokenStat[]> {
   const ch = getClickHouseClient();
-  
+
   const result = await ch.query({
     query: `
       SELECT
-        give_token_symbol AS symbol,
+        symbol,
         sum(order_count) AS order_count,
         sum(volume_usd) AS volume_usd
       FROM token_stats_mv
-      WHERE give_token_symbol IS NOT NULL AND give_token_symbol != ''
-      GROUP BY give_token_symbol
+      WHERE symbol IS NOT NULL AND symbol != ''
+      GROUP BY symbol
       ORDER BY volume_usd DESC
       LIMIT {limit: UInt32}
     `,
     query_params: { limit },
     format: 'JSONEachRow',
   });
-  
+
   return result.json<TokenStat>();
 }
 

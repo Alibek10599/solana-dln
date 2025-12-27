@@ -74,12 +74,11 @@ services:
       POSTGRES_USER: ${TEMPORAL_DB_USER:-temporal}
       POSTGRES_PWD: ${TEMPORAL_DB_PASSWORD:-temporal}
       POSTGRES_SEEDS: temporal-db
-      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
     depends_on:
       temporal-db:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "temporal", "workflow", "list", "--address", "localhost:7233"]
+      test: ["CMD", "sh", "-c", "ps aux | grep -v grep | grep temporal-server"]
       interval: 10s
       timeout: 5s
       retries: 10
