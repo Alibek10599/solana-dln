@@ -31,9 +31,22 @@ export class BorshDeserializer {
   }
 
   /**
+   * Check if we have enough bytes to read
+   */
+  private ensureBytes(count: number): void {
+    if (this.offset + count > this.buffer.length) {
+      throw new Error(
+        `Buffer overflow: need ${count} bytes at offset ${this.offset}, ` +
+        `but only ${this.buffer.length - this.offset} remaining (buffer length: ${this.buffer.length})`
+      );
+    }
+  }
+
+  /**
    * Read unsigned 8-bit integer
    */
   readU8(): number {
+    this.ensureBytes(1);
     const value = this.buffer.readUInt8(this.offset);
     this.offset += 1;
     return value;
@@ -43,6 +56,7 @@ export class BorshDeserializer {
    * Read unsigned 16-bit integer (little-endian)
    */
   readU16(): number {
+    this.ensureBytes(2);
     const value = this.buffer.readUInt16LE(this.offset);
     this.offset += 2;
     return value;
@@ -52,6 +66,7 @@ export class BorshDeserializer {
    * Read unsigned 32-bit integer (little-endian)
    */
   readU32(): number {
+    this.ensureBytes(4);
     const value = this.buffer.readUInt32LE(this.offset);
     this.offset += 4;
     return value;
@@ -61,6 +76,7 @@ export class BorshDeserializer {
    * Read unsigned 64-bit integer (little-endian)
    */
   readU64(): bigint {
+    this.ensureBytes(8);
     const value = this.buffer.readBigUInt64LE(this.offset);
     this.offset += 8;
     return value;
@@ -70,6 +86,7 @@ export class BorshDeserializer {
    * Read unsigned 128-bit integer (little-endian)
    */
   readU128(): bigint {
+    this.ensureBytes(16);
     const low = this.buffer.readBigUInt64LE(this.offset);
     const high = this.buffer.readBigUInt64LE(this.offset + 8);
     this.offset += 16;
@@ -90,6 +107,7 @@ export class BorshDeserializer {
    * Read fixed-size byte array
    */
   readBytes(length: number): Buffer {
+    this.ensureBytes(length);
     const bytes = this.buffer.slice(this.offset, this.offset + length);
     this.offset += length;
     return bytes;
@@ -142,6 +160,7 @@ export class BorshDeserializer {
    * Skip bytes
    */
   skip(length: number): void {
+    this.ensureBytes(length);
     this.offset += length;
   }
 
@@ -149,6 +168,7 @@ export class BorshDeserializer {
    * Peek at next byte without advancing
    */
   peek(): number {
+    this.ensureBytes(1);
     return this.buffer.readUInt8(this.offset);
   }
 

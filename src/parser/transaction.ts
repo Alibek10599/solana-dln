@@ -402,6 +402,22 @@ function calculateUsdValue(
   return undefined;
 }
 
+// Track parsing statistics
+let parseStats = {
+  total: 0,
+  success: 0,
+  failed: 0,
+  noEvents: 0,
+};
+
+export function getParseStats() {
+  return { ...parseStats };
+}
+
+export function resetParseStats() {
+  parseStats = { total: 0, success: 0, failed: 0, noEvents: 0 };
+}
+
 /**
  * Batch parse multiple transactions
  */
@@ -417,12 +433,35 @@ export async function parseTransactions(
     
     if (!tx) continue;
     
+    parseStats.total++;
+    
     try {
       const events = await parseTransaction(tx, sig);
-      allEvents.push(...events);
+      if (events.length > 0) {
+        parseStats.success++;
+        allEvents.push(...events);
+      } else {
+        parseStats.noEvents++;
+      }
     } catch (error) {
-      logger.debug({ error, signature: sig }, 'Failed to parse transaction');
+      parseStats.failed++;
+      // Log at warn level so we can see patterns of failures
+      logger.warn({ 
+        error: error instanceof Error ? error.message : String(error), 
+        signature: sig 
+      }, 'Failed to parse transaction');
     }
+  }
+  
+  // Log batch stats periodically
+  if (parseStats.total % 1000 === 0) {
+    logger.info({
+      total: parseStats.total,
+      success: parseStats.success,
+      failed: parseStats.failed,
+      noEvents: parseStats.noEvents,
+      successRate: `${((parseStats.success / parseStats.total) * 100).toFixed(1)}%`,
+    }, 'Parse statistics');
   }
   
   return allEvents;

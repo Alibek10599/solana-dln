@@ -395,15 +395,50 @@ export async function fetchAndParseTransactions(
   }, 'Fetching transactions');
   
   try {
-    // Fetch transactions
-    const transactions = await connection.getParsedTransactions(
-      input.signatures,
-      {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed',
+    // Fetch transactions (individually for free tier RPCs that don't support batch)
+    const useBatchRequests = process.env.RPC_BATCH_REQUESTS !== 'false';
+    let transactions;
+
+    if (useBatchRequests) {
+      // Use batch request (faster, requires paid RPC tier)
+      transactions = await connection.getParsedTransactions(
+        input.signatures,
+        {
+          maxSupportedTransactionVersion: 0,
+          commitment: 'confirmed',
+        }
+      );
+    } else {
+      // Fetch individually (slower, works with free tier RPCs)
+      transactions = [];
+      for (let i = 0; i < input.signatures.length; i++) {
+        const sig = input.signatures[i];
+        try {
+          const tx = await connection.getParsedTransaction(sig, {
+            maxSupportedTransactionVersion: 0,
+            commitment: 'confirmed',
+          });
+          transactions.push(tx);
+
+          // Heartbeat every 10 transactions
+          if ((i + 1) % 10 === 0) {
+            Context.current().heartbeat({
+              phase: 'fetching_transactions',
+              progress: `${i + 1}/${input.signatures.length}`,
+            });
+          }
+
+          // Small delay to avoid rate limiting
+          if (i < input.signatures.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+        } catch (err) {
+          logger.warn({ error: err, signature: sig }, 'Failed to fetch transaction');
+          transactions.push(null);
+        }
       }
-    );
-    
+    }
+
     // Heartbeat before parsing
     Context.current().heartbeat({ phase: 'parsing_transactions' });
     
