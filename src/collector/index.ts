@@ -35,19 +35,16 @@ import {
   type OrderEvent,
 } from '../db/clickhouse.js';
 import { parseTransactions } from '../parser/transaction.js';
-import { logger } from '../utils/logger.js';
-import { 
-  withRetry, 
-  sleep, 
-  RateLimiter, 
-  CircuitBreaker,
-  isRetryableError,
-} from '../utils/retry.js';
+import { createChildLogger } from '../utils/logger.js';
+import { withRetry, isRetryableError } from '../utils/retry.js';
+import { config } from '../config/index.js';
 
-// Configuration from environment
-const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-const TARGET_CREATED = parseInt(process.env.TARGET_CREATED_ORDERS || '25000');
-const TARGET_FULFILLED = parseInt(process.env.TARGET_FULFILLED_ORDERS || '25000');
+const logger = createChildLogger('collector');
+
+// Configuration from config
+const SOLANA_RPC_URL = config.solana.rpcUrl;
+const TARGET_CREATED = config.collection.targetCreatedOrders;
+const TARGET_FULFILLED = config.collection.targetFulfilledOrders;
 const SIGNATURES_BATCH_SIZE = parseInt(process.env.SIGNATURES_BATCH_SIZE || '1000');
 const TX_BATCH_SIZE = parseInt(process.env.TX_BATCH_SIZE || '20'); // Reduced for stability
 const BATCH_DELAY_MS = parseInt(process.env.BATCH_DELAY_MS || '500');
@@ -55,10 +52,11 @@ const BATCH_DELAY_MS = parseInt(process.env.BATCH_DELAY_MS || '500');
 // Rate limiter: ~2 requests per second for public RPC
 // Increase for premium RPC providers
 const RATE_LIMIT_RPS = parseFloat(process.env.RATE_LIMIT_RPS || '2');
-const rateLimiter = new RateLimiter(5, RATE_LIMIT_RPS);
 
-// Circuit breaker for RPC failures
-const circuitBreaker = new CircuitBreaker(10, 60000); // 10 failures, 60s timeout
+// Helper sleep function
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * Create Solana connection with retry settings
@@ -84,27 +82,21 @@ async function* fetchSignatures(
   const MAX_EMPTY_BATCHES = 3;
   
   while (true) {
-    // Rate limiting
-    await rateLimiter.acquire();
-    
     try {
-      const signatures = await circuitBreaker.execute(() =>
-        withRetry(
-          () => connection.getSignaturesForAddress(
-            programId,
-            {
-              before,
-              limit: SIGNATURES_BATCH_SIZE,
-            },
-            'confirmed'
-          ),
+      const signatures = await withRetry(
+        () => connection.getSignaturesForAddress(
+          programId,
           {
-            maxRetries: 5,
-            baseDelayMs: 2000,
-            maxDelayMs: 30000,
-            context: 'getSignaturesForAddress',
-          }
-        )
+            before,
+            limit: SIGNATURES_BATCH_SIZE,
+          },
+          'confirmed'
+        ),
+        {
+          maxRetries: 5,
+          initialDelayMs: 2000,
+          maxDelayMs: 30000,
+        }
       );
       
       if (signatures.length === 0) {
@@ -128,11 +120,9 @@ async function* fetchSignatures(
       await sleep(BATCH_DELAY_MS);
       
     } catch (error) {
-      if ((error as Error).message?.includes('Circuit breaker')) {
-        logger.error('Circuit breaker is open, waiting before retry...');
-        await sleep(60000); // Wait 1 minute
-        continue;
-      }
+      // Error handling - retry after delay
+      logger.error({ error }, 'Collection error, retrying...');
+      await sleep(10000); // Wait 10 seconds before retry
       
       logger.error({ error }, 'Failed to fetch signatures after all retries');
       throw error;
@@ -147,26 +137,20 @@ async function fetchTransactionsBatch(
   connection: Connection,
   signatures: string[]
 ): Promise<(ParsedTransactionWithMeta | null)[]> {
-  // Rate limiting
-  await rateLimiter.acquire();
-  
   try {
-    const transactions = await circuitBreaker.execute(() =>
-      withRetry(
-        () => connection.getParsedTransactions(
-          signatures,
-          {
-            maxSupportedTransactionVersion: 0,
-            commitment: 'confirmed',
-          }
-        ),
+    const transactions = await withRetry(
+      () => connection.getParsedTransactions(
+        signatures,
         {
-          maxRetries: 5,
-          baseDelayMs: 2000,
-          maxDelayMs: 30000,
-          context: 'getParsedTransactions',
+          maxSupportedTransactionVersion: 0,
+          commitment: 'confirmed',
         }
-      )
+      ),
+      {
+        maxRetries: 5,
+        initialDelayMs: 2000,
+        maxDelayMs: 30000,
+      }
     );
     
     return transactions;
@@ -312,7 +296,6 @@ async function collectFromProgram(
       target: targetCount,
       progress: `${((totalCollected / targetCount) * 100).toFixed(1)}%`,
       rate: `${eventsPerMinute.toFixed(1)} events/min`,
-      circuitBreaker: circuitBreaker.getState(),
     }, 'Progress update');
   }
   
@@ -360,7 +343,7 @@ async function main(): Promise<void> {
     // Test connection with retry
     const slot = await withRetry(
       () => connection.getSlot(),
-      { maxRetries: 3, context: 'getSlot' }
+      { maxRetries: 3 }
     );
     logger.info({ slot }, 'Connected to Solana');
     

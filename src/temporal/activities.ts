@@ -213,8 +213,17 @@ export async function storeEvents(input: StoreEventsInput): Promise<StoreEventsO
       return { insertedCount: 0, duplicateCount: 0, totalCollected };
     }
     
+    // Deserialize events from Temporal (convert string to BigInt, ISO string to Date)
+    const deserializedEvents: OrderEvent[] = input.events.map((e: any) => ({
+      ...e,
+      give_amount: e.give_amount ? BigInt(e.give_amount) : undefined,
+      take_amount: e.take_amount ? BigInt(e.take_amount) : undefined,
+      fulfilled_amount: e.fulfilled_amount ? BigInt(e.fulfilled_amount) : undefined,
+      block_time: new Date(e.block_time),
+    }));
+
     // Insert with deduplication
-    const insertedCount = await insertOrderEventsDeduped(input.events);
+    const insertedCount = await insertOrderEventsDeduped(deserializedEvents);
     const duplicateCount = input.events.length - insertedCount;
     
     // Get updated total
@@ -448,10 +457,19 @@ export async function fetchAndParseTransactions(
     
     // Parse events
     const allEvents = await parseTransactions(transactions, input.signatures);
-    
+
     // Filter by event type
     const events = allEvents.filter(e => e.event_type === input.eventType);
-    
+
+    // Serialize events for Temporal (convert BigInt to string, Date to ISO string)
+    const serializedEvents = events.map(e => ({
+      ...e,
+      give_amount: e.give_amount ? e.give_amount.toString() : undefined,
+      take_amount: e.take_amount ? e.take_amount.toString() : undefined,
+      fulfilled_amount: e.fulfilled_amount ? e.fulfilled_amount.toString() : undefined,
+      block_time: e.block_time.toISOString(),
+    })) as any; // Type will be deserialized in storeOrderEvents
+
     logger.info({
       activityId: info.activityId,
       fetched: transactions.length,
@@ -459,8 +477,8 @@ export async function fetchAndParseTransactions(
       errors: errorCount,
       events: events.length,
     }, 'Transactions parsed');
-    
-    return { events, processedCount, errorCount };
+
+    return { events: serializedEvents, processedCount, errorCount };
     
   } catch (error) {
     logger.error({ error, signatureCount: input.signatures.length }, 'Failed to fetch/parse transactions');

@@ -6,20 +6,28 @@
  */
 
 import { createClient, ClickHouseClient } from '@clickhouse/client';
-import { logger } from '../utils/logger.js';
+import { createChildLogger } from '../utils/logger.js';
+import { config } from '../config/index.js';
+
+const logger = createChildLogger('clickhouse');
 
 let client: ClickHouseClient | null = null;
 
 export function getClickHouseClient(): ClickHouseClient {
   if (!client) {
+    logger.info(
+      { url: config.clickhouse.url, database: config.clickhouse.database },
+      'Initializing ClickHouse client'
+    );
+
     client = createClient({
-      url: process.env.CLICKHOUSE_URL || 'http://localhost:8123',
-      database: process.env.CLICKHOUSE_DATABASE || 'dln_dashboard',
-      username: process.env.CLICKHOUSE_USER || 'default',
-      password: process.env.CLICKHOUSE_PASSWORD || '',
+      url: config.clickhouse.url,
+      database: config.clickhouse.database,
+      username: config.clickhouse.user,
+      password: config.clickhouse.password,
       clickhouse_settings: {
-        async_insert: 1,
-        wait_for_async_insert: 0,
+        async_insert: config.clickhouse.asyncInsert ? 1 : 0,
+        wait_for_async_insert: config.clickhouse.waitForAsyncInsert ? 1 : 0,
       },
     });
   }
@@ -221,26 +229,27 @@ export async function insertOrderEvents(events: OrderEvent[]): Promise<number> {
   const ch = getClickHouseClient();
   
   // Convert to ClickHouse format
+  // Note: BigInt values are kept as-is - ClickHouse client handles serialization
   const rows = events.map(e => ({
     order_id: e.order_id,
     event_type: e.event_type,
     signature: e.signature,
     slot: e.slot,
-    block_time: e.block_time,
+    block_time: Math.floor(e.block_time.getTime() / 1000), // Convert to Unix timestamp (seconds)
     maker: e.maker || null,
     give_token_address: e.give_token_address || null,
     give_token_symbol: e.give_token_symbol || null,
-    give_amount: e.give_amount ? e.give_amount.toString() : null,
+    give_amount: e.give_amount || null, // Keep as BigInt - client serializes it
     give_amount_usd: e.give_amount_usd || null,
     give_chain_id: e.give_chain_id || null,
     take_token_address: e.take_token_address || null,
     take_token_symbol: e.take_token_symbol || null,
-    take_amount: e.take_amount ? e.take_amount.toString() : null,
+    take_amount: e.take_amount || null, // Keep as BigInt
     take_amount_usd: e.take_amount_usd || null,
     take_chain_id: e.take_chain_id || null,
     receiver: e.receiver || null,
     taker: e.taker || null,
-    fulfilled_amount: e.fulfilled_amount ? e.fulfilled_amount.toString() : null,
+    fulfilled_amount: e.fulfilled_amount || null, // Keep as BigInt
     fulfilled_amount_usd: e.fulfilled_amount_usd || null,
   }));
   
@@ -368,7 +377,7 @@ export async function updateCollectionProgress(
       event_type: eventType,
       last_signature: lastSignature,
       total_collected: totalCollected,
-      updated_at: new Date(),
+      updated_at: Math.floor(Date.now() / 1000), // Convert to Unix timestamp (seconds)
     }],
     format: 'JSONEachRow',
   });
