@@ -2,7 +2,7 @@
 # DLN Solana Dashboard - Makefile
 # =============================================================================
 
-.PHONY: help build up down logs restart clean dev infra collect status env-check
+.PHONY: help build up down logs restart clean dev infra collect status env-check monitoring
 
 # Default target
 help:
@@ -26,8 +26,11 @@ help:
 	@echo "  make logs-worker   - Follow worker logs"
 	@echo ""
 	@echo "Scaling:"
-	@echo "  make up-scaled     - Start with scaled workers"
+	@echo "  make up-scaled     - Start with scaled workers + monitoring"
 	@echo "  make scale-rpc N=3 - Scale RPC workers to N instances"
+	@echo ""
+	@echo "Monitoring:"
+	@echo "  make monitoring    - Start Prometheus and Grafana"
 	@echo ""
 	@echo "Temporal:"
 	@echo "  make collect       - Start collection workflow"
@@ -92,6 +95,17 @@ dev:
 
 infra: dev
 
+# Start monitoring stack (Prometheus + Grafana)
+monitoring: env-check
+	docker compose --profile monitoring up -d
+	@echo ""
+	@echo "✅ Monitoring started!"
+	@echo ""
+	@echo "Services:"
+	@echo "  - Prometheus:  http://localhost:$${PROMETHEUS_PORT:-9090}"
+	@echo "  - Grafana:     http://localhost:$${GRAFANA_PORT:-3002}"
+	@echo "    (Login: admin/admin)"
+
 # =============================================================================
 # Docker Operations
 # =============================================================================
@@ -104,6 +118,11 @@ build: env-check
 # Start all services
 up: env-check
 	docker compose up -d
+	@echo ""
+	@echo "⏳ Waiting for services to be healthy..."
+	@sleep 5
+	@echo "🔧 Running database migrations..."
+	@docker compose exec api node dist/db/migrate.js || echo "⚠️  Migration failed - services may still be starting"
 	@echo ""
 	@echo "✅ All services started!"
 	@echo ""
@@ -119,12 +138,23 @@ up: env-check
 
 # Start with scaled workers
 up-scaled: env-check
-	docker compose --profile scaled up -d
-	@echo "✅ Started with scaled workers"
+	docker compose --profile scaled --profile monitoring up -d
+	@echo ""
+	@echo "⏳ Waiting for services to be healthy..."
+	@sleep 5
+	@echo "🔧 Running database migrations..."
+	@docker compose exec api node dist/db/migrate.js || echo "⚠️  Migration failed - services may still be starting"
+	@echo ""
+	@echo "✅ Started with scaled workers and monitoring!"
+	@echo ""
+	@echo "Monitoring:"
+	@echo "  - Prometheus:  http://localhost:$${PROMETHEUS_PORT:-9090}"
+	@echo "  - Grafana:     http://localhost:$${GRAFANA_PORT:-3002}"
+	@echo "    (Login: admin/admin)"
 
 # Stop all services
 down:
-	docker compose --profile scaled --profile tools down
+	docker compose --profile scaled --profile monitoring --profile tools down
 	@echo "✅ All services stopped"
 
 # Restart all services
@@ -194,7 +224,7 @@ health: env-check
 
 # Clean up everything
 clean:
-	docker compose --profile scaled --profile tools down -v
+	docker compose --profile scaled --profile monitoring --profile tools down -v
 	docker system prune -f
 	@echo "✅ Cleaned up containers and volumes"
 

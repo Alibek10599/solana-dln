@@ -75,17 +75,17 @@ cd dln-solana-dashboard
 # Create .env file with your Solana RPC URL
 echo "SOLANA_RPC_URL=https://api.mainnet-beta.solana.com" > .env
 
-# Start everything
-docker-compose up -d
-
-# Wait for services to be ready (~60 seconds)
-docker-compose logs -f temporal
+# Start everything (automatically runs migrations)
+make up
+# Or: docker-compose up -d && sleep 5 && docker-compose exec api node dist/db/migrate.js
 
 # Start collection workflow
-docker-compose exec worker node dist/temporal/client.js start
+make collect
+# Or: docker-compose exec worker node dist/temporal/client.js start
 
 # Watch progress
-docker-compose exec worker node dist/temporal/client.js watch
+make watch
+# Or: docker-compose exec worker node dist/temporal/client.js watch
 ```
 
 **Services:**
@@ -104,10 +104,12 @@ docker-compose exec worker node dist/temporal/client.js watch
 - Docker (for ClickHouse and Temporal)
 - Solana RPC endpoint (public or Helius/QuickNode)
 
-### 1. Start ClickHouse
+### 1. Start Infrastructure
 
 ```bash
-docker-compose up -d
+# Start ClickHouse, Temporal, and database
+make dev
+# Or: docker-compose up -d clickhouse temporal temporal-db temporal-ui
 ```
 
 ### 2. Install Dependencies
@@ -133,6 +135,7 @@ cp .env.example .env
 
 ```bash
 npm run migrate
+# Note: 'make up' runs this automatically, but for local dev you need to run it manually
 ```
 
 ### 5. Collect Data
@@ -545,10 +548,33 @@ docker-compose --profile scaled up -d
 # Scale specific worker type
 docker-compose --profile scaled up -d --scale worker-rpc=3
 
-# Or use Makefile
+# Or use Makefile (includes monitoring)
 make up-scaled
 make scale-rpc N=3
 ```
+
+### Monitoring
+
+The project includes Prometheus and Grafana for monitoring:
+
+```bash
+# Start monitoring stack only
+make monitoring
+
+# Or include monitoring with scaled workers
+make up-scaled
+
+# Access monitoring services
+# Prometheus: http://localhost:9090
+# Grafana: http://localhost:3002 (admin/admin)
+```
+
+**What's monitored:**
+- RPC connection pool health and circuit breaker status
+- API request rates and response times
+- Worker activity execution metrics
+- ClickHouse query performance
+- Collection progress and throughput
 
 ## Project Structure
 
