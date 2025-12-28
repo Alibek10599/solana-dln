@@ -34,7 +34,7 @@ interface SSEClient {
 }
 
 const sseClients: Map<string, SSEClient> = new Map();
-let sseUpdateInterval: NodeJS.Timeout | null = null;
+let sseUpdateInterval: ReturnType<typeof setInterval> | null = null;
 
 function generateClientId(): string {
   return `client-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -102,7 +102,6 @@ async function fetchAndBroadcastUpdates(): Promise<void> {
 function startSSEUpdates(): void {
   if (sseUpdateInterval) return;
   
-  // Update every 2 seconds when clients are connected
   sseUpdateInterval = setInterval(fetchAndBroadcastUpdates, 2000);
   logger.info('SSE updates started');
 }
@@ -122,7 +121,6 @@ function stopSSEUpdates(): void {
 app.use(cors());
 app.use(express.json());
 
-// Request logging (skip SSE to avoid log spam)
 app.use((req: Request, res: Response, next: NextFunction) => {
   if (req.path === '/api/events') {
     return next();
@@ -140,7 +138,6 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Error handler wrapper
 function asyncHandler(fn: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response, next: NextFunction) => {
     Promise.resolve(fn(req, res)).catch(next);
@@ -151,35 +148,26 @@ function asyncHandler(fn: (req: Request, res: Response) => Promise<void>) {
 // SSE Endpoint
 // =============================================================================
 
-/**
- * Server-Sent Events endpoint for real-time updates
- */
 app.get('/api/events', (req: Request, res: Response) => {
   const clientId = generateClientId();
   
-  // Set SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
   
-  // Send initial connection message
   res.write(`event: connected\ndata: {"clientId": "${clientId}"}\n\n`);
   
-  // Add client to list
   sseClients.set(clientId, { id: clientId, res });
   logger.info({ clientId, totalClients: sseClients.size }, 'SSE client connected');
   
-  // Start updates if first client
   if (sseClients.size === 1) {
     startSSEUpdates();
   }
   
-  // Send immediate update
   fetchAndBroadcastUpdates();
   
-  // Heartbeat to keep connection alive
   const heartbeat = setInterval(() => {
     try {
       res.write(`: heartbeat\n\n`);
@@ -188,13 +176,11 @@ app.get('/api/events', (req: Request, res: Response) => {
     }
   }, 30000);
   
-  // Clean up on disconnect
   req.on('close', () => {
     clearInterval(heartbeat);
     sseClients.delete(clientId);
     logger.info({ clientId, totalClients: sseClients.size }, 'SSE client disconnected');
     
-    // Stop updates if no clients
     if (sseClients.size === 0) {
       stopSSEUpdates();
     }
@@ -205,16 +191,10 @@ app.get('/api/events', (req: Request, res: Response) => {
 // REST Endpoints
 // =============================================================================
 
-/**
- * Health check
- */
 app.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-/**
- * Get dashboard overview stats
- */
 app.get('/api/stats', asyncHandler(async (req: Request, res: Response) => {
   const stats = await getTotalStats();
 
@@ -229,9 +209,6 @@ app.get('/api/stats', asyncHandler(async (req: Request, res: Response) => {
   });
 }));
 
-/**
- * Get daily volumes for charts
- */
 app.get('/api/daily-volumes', asyncHandler(async (req: Request, res: Response) => {
   const days = parseInt(req.query.days as string) || 30;
   const volumes = await getDailyVolumes(Math.min(days, 365));
@@ -248,9 +225,6 @@ app.get('/api/daily-volumes', asyncHandler(async (req: Request, res: Response) =
   });
 }));
 
-/**
- * Get top tokens by volume
- */
 app.get('/api/top-tokens', asyncHandler(async (req: Request, res: Response) => {
   const limit = parseInt(req.query.limit as string) || 10;
   const tokens = await getTopTokens(Math.min(limit, 50));
@@ -265,9 +239,6 @@ app.get('/api/top-tokens', asyncHandler(async (req: Request, res: Response) => {
   });
 }));
 
-/**
- * Get recent orders
- */
 app.get('/api/recent-orders', asyncHandler(async (req: Request, res: Response) => {
   const limit = parseInt(req.query.limit as string) || 50;
   const orders = await getRecentOrders(Math.min(limit, 200));
@@ -289,9 +260,6 @@ app.get('/api/recent-orders', asyncHandler(async (req: Request, res: Response) =
   });
 }));
 
-/**
- * Get collection progress
- */
 app.get('/api/collection-progress', asyncHandler(async (req: Request, res: Response) => {
   const [createdProgress, fulfilledProgress] = await Promise.all([
     getCollectionProgress(DLN_SOURCE_PROGRAM_ID.toBase58(), 'created'),
@@ -313,9 +281,6 @@ app.get('/api/collection-progress', asyncHandler(async (req: Request, res: Respo
   });
 }));
 
-/**
- * Get RPC pool and parser metrics
- */
 app.get('/api/metrics', asyncHandler(async (req: Request, res: Response) => {
   const poolStats = getRpcPool().getStats();
   const parseStats = getParseStats();
@@ -331,8 +296,61 @@ app.get('/api/metrics', asyncHandler(async (req: Request, res: Response) => {
 }));
 
 /**
- * Prometheus-compatible metrics endpoint
+ * Debug endpoint - check USD calculation data
  */
+app.get('/api/debug/usd', asyncHandler(async (req: Request, res: Response) => {
+  const ch = getClickHouseClient();
+  
+  // Check token addresses in database
+  const tokenAddresses = await ch.query({
+    query: `
+      SELECT 
+        give_token_address,
+        give_token_symbol,
+        count() as cnt,
+        sum(give_amount_usd) as total_usd
+      FROM orders FINAL
+      WHERE event_type = 'created'
+      GROUP BY give_token_address, give_token_symbol
+      ORDER BY cnt DESC
+      LIMIT 20
+    `,
+    format: 'JSONEachRow',
+  });
+  
+  const tokens = await tokenAddresses.json();
+  
+  // Get sample of orders with and without USD
+  const sampleWithUsd = await ch.query({
+    query: `
+      SELECT order_id, give_token_address, give_token_symbol, give_amount, give_amount_usd
+      FROM orders FINAL
+      WHERE event_type = 'created' AND give_amount_usd > 0
+      LIMIT 5
+    `,
+    format: 'JSONEachRow',
+  });
+  
+  const sampleWithoutUsd = await ch.query({
+    query: `
+      SELECT order_id, give_token_address, give_token_symbol, give_amount, give_amount_usd
+      FROM orders FINAL
+      WHERE event_type = 'created' AND (give_amount_usd IS NULL OR give_amount_usd = 0)
+      LIMIT 5
+    `,
+    format: 'JSONEachRow',
+  });
+  
+  res.json({
+    success: true,
+    data: {
+      tokenAddresses: tokens,
+      sampleWithUsd: await sampleWithUsd.json(),
+      sampleWithoutUsd: await sampleWithoutUsd.json(),
+    },
+  });
+}));
+
 app.get('/metrics', asyncHandler(async (req: Request, res: Response) => {
   const poolStats = getRpcPool().getStats();
   const parseStats = getParseStats();
@@ -400,15 +418,12 @@ app.get('/metrics', asyncHandler(async (req: Request, res: Response) => {
   res.type('text/plain').send(lines.join('\n'));
 }));
 
-/**
- * Get full dashboard data in one call
- */
 app.get('/api/dashboard', asyncHandler(async (req: Request, res: Response) => {
   const [stats, volumes, tokens, recentOrders, createdProgress, fulfilledProgress] = await Promise.all([
     getTotalStats(),
     getDailyVolumes(30),
     getTopTokens(10),
-    getRecentOrders(20),
+    getRecentOrders(100), // Increased limit for pagination
     getCollectionProgress(DLN_SOURCE_PROGRAM_ID.toBase58(), 'created'),
     getCollectionProgress(DLN_DESTINATION_PROGRAM_ID.toBase58(), 'fulfilled'),
   ]);
@@ -474,14 +489,13 @@ const server = app.listen(PORT, () => {
   logger.info({ port: PORT }, 'API server started');
   logger.info(`Dashboard API available at http://localhost:${PORT}`);
   logger.info(`SSE endpoint available at http://localhost:${PORT}/api/events`);
+  logger.info(`Debug endpoint available at http://localhost:${PORT}/api/debug/usd`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', async () => {
   logger.info('Shutting down...');
   stopSSEUpdates();
   
-  // Close all SSE connections
   for (const [id, client] of sseClients) {
     client.res.end();
   }
