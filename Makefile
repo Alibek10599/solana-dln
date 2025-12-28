@@ -18,7 +18,7 @@ help:
 	@echo ""
 	@echo "Docker:"
 	@echo "  make build         - Build all Docker images"
-	@echo "  make up            - Start all services"
+	@echo "  make up            - Start all services + migrate + start collection"
 	@echo "  make down          - Stop all services"
 	@echo "  make restart       - Restart all services"
 	@echo "  make logs          - Follow logs for all services"
@@ -26,7 +26,7 @@ help:
 	@echo "  make logs-worker   - Follow worker logs"
 	@echo ""
 	@echo "Scaling:"
-	@echo "  make up-scaled     - Start with scaled workers + monitoring"
+	@echo "  make up-scaled     - Start with scaled workers + monitoring + collection"
 	@echo "  make scale-rpc N=3 - Scale RPC workers to N instances"
 	@echo ""
 	@echo "Monitoring:"
@@ -42,6 +42,7 @@ help:
 	@echo ""
 	@echo "Maintenance:"
 	@echo "  make clean         - Remove all containers and volumes"
+	@echo "  make reset         - Clean + rebuild + start fresh"
 	@echo "  make shell-api     - Open shell in API container"
 	@echo "  make shell-worker  - Open shell in worker container"
 
@@ -65,7 +66,7 @@ env:
 	fi
 	cp .env.example .env
 	@echo "✅ Created .env from .env.example"
-	@echo "   Edit .env to configure your settings (especially SOLANA_RPC_URL)"
+	@echo "   Edit .env to configure your settings (especially RPC_URLS)"
 
 # Install dependencies
 install:
@@ -115,42 +116,77 @@ build: env-check
 	docker compose build
 	@echo "✅ Images built"
 
-# Start all services
+# Start all services with migration and collection
 up: env-check
+	@echo "🚀 Starting DLN Solana Dashboard..."
+	@echo ""
 	docker compose up -d
 	@echo ""
 	@echo "⏳ Waiting for services to be healthy..."
-	@sleep 5
+	@sleep 10
+	@echo ""
 	@echo "🔧 Running database migrations..."
-	@docker compose exec api node dist/db/migrate.js || echo "⚠️  Migration failed - services may still be starting"
+	@docker compose exec -T api node dist/db/migrate.js 2>/dev/null || \
+		(echo "⏳ Waiting for API to be ready..." && sleep 5 && \
+		docker compose exec -T api node dist/db/migrate.js)
 	@echo ""
-	@echo "✅ All services started!"
+	@echo "🎬 Starting collection workflow..."
+	@docker compose exec -T worker node dist/temporal/client.js start 2>/dev/null || \
+		(echo "⏳ Waiting for worker to be ready..." && sleep 5 && \
+		docker compose exec -T worker node dist/temporal/client.js start) || \
+		echo "⚠️  Workflow may already be running (check 'make status')"
 	@echo ""
-	@echo "Services:"
-	@echo "  - Dashboard:    http://localhost:$${DASHBOARD_PORT:-3000}"
-	@echo "  - API:          http://localhost:$${API_PORT:-3001}"
-	@echo "  - Temporal UI:  http://localhost:$${TEMPORAL_UI_PORT:-8233}"
-	@echo "  - ClickHouse:   http://localhost:$${CLICKHOUSE_PORT:-8123}"
+	@echo "════════════════════════════════════════════════════════════"
+	@echo "✅ DLN Dashboard is running!"
+	@echo "════════════════════════════════════════════════════════════"
 	@echo ""
-	@echo "Next steps:"
-	@echo "  make collect    - Start data collection"
-	@echo "  make watch      - Watch progress"
+	@echo "📊 Dashboard:    http://localhost:$${DASHBOARD_PORT:-3000}"
+	@echo "🔌 API:          http://localhost:$${API_PORT:-3001}"
+	@echo "📈 Metrics:      http://localhost:$${API_PORT:-3001}/metrics"
+	@echo "⚡ Temporal UI:  http://localhost:$${TEMPORAL_UI_PORT:-8233}"
+	@echo ""
+	@echo "Commands:"
+	@echo "  make watch      - Watch collection progress"
+	@echo "  make status     - Check workflow status"
+	@echo "  make logs       - View logs"
+	@echo ""
 
-# Start with scaled workers
+# Start with scaled workers + monitoring + collection
 up-scaled: env-check
+	@echo "🚀 Starting DLN Solana Dashboard (Scaled Mode)..."
+	@echo ""
 	docker compose --profile scaled --profile monitoring up -d
 	@echo ""
 	@echo "⏳ Waiting for services to be healthy..."
-	@sleep 5
+	@sleep 10
+	@echo ""
 	@echo "🔧 Running database migrations..."
-	@docker compose exec api node dist/db/migrate.js || echo "⚠️  Migration failed - services may still be starting"
+	@docker compose exec -T api node dist/db/migrate.js 2>/dev/null || \
+		(echo "⏳ Waiting for API to be ready..." && sleep 5 && \
+		docker compose exec -T api node dist/db/migrate.js)
 	@echo ""
-	@echo "✅ Started with scaled workers and monitoring!"
+	@echo "🎬 Starting collection workflow..."
+	@docker compose exec -T worker node dist/temporal/client.js start 2>/dev/null || \
+		(echo "⏳ Waiting for worker to be ready..." && sleep 5 && \
+		docker compose exec -T worker node dist/temporal/client.js start) || \
+		echo "⚠️  Workflow may already be running (check 'make status')"
 	@echo ""
-	@echo "Monitoring:"
-	@echo "  - Prometheus:  http://localhost:$${PROMETHEUS_PORT:-9090}"
-	@echo "  - Grafana:     http://localhost:$${GRAFANA_PORT:-3002}"
-	@echo "    (Login: admin/admin)"
+	@echo "════════════════════════════════════════════════════════════"
+	@echo "✅ DLN Dashboard is running (Scaled Mode)!"
+	@echo "════════════════════════════════════════════════════════════"
+	@echo ""
+	@echo "📊 Dashboard:    http://localhost:$${DASHBOARD_PORT:-3000}"
+	@echo "🔌 API:          http://localhost:$${API_PORT:-3001}"
+	@echo "📈 Metrics:      http://localhost:$${API_PORT:-3001}/metrics"
+	@echo "⚡ Temporal UI:  http://localhost:$${TEMPORAL_UI_PORT:-8233}"
+	@echo "📉 Prometheus:   http://localhost:$${PROMETHEUS_PORT:-9090}"
+	@echo "📊 Grafana:      http://localhost:$${GRAFANA_PORT:-3002} (admin/admin)"
+	@echo ""
+	@echo "Commands:"
+	@echo "  make watch      - Watch collection progress"
+	@echo "  make status     - Check workflow status"
+	@echo "  make logs       - View logs"
+	@echo ""
 
 # Stop all services
 down:
@@ -228,6 +264,17 @@ clean:
 	docker system prune -f
 	@echo "✅ Cleaned up containers and volumes"
 
+# Full reset - clean, rebuild, and start fresh
+reset: env-check
+	@echo "🧹 Cleaning up..."
+	docker compose --profile scaled --profile monitoring --profile tools down -v
+	@echo ""
+	@echo "🔨 Rebuilding images..."
+	docker compose build --no-cache
+	@echo ""
+	@echo "🚀 Starting fresh..."
+	$(MAKE) up-scaled
+
 # Shell access
 shell-api:
 	docker compose exec api sh
@@ -252,7 +299,7 @@ run-api:
 
 # Run Temporal worker locally (requires: make dev)
 run-worker:
-	npm run worker
+	npm run temporal:worker
 
 # Run dashboard locally
 run-dashboard:
@@ -272,9 +319,17 @@ config:
 # Validate environment
 validate: env-check
 	@echo "Validating configuration..."
-	@if [ -z "$${SOLANA_RPC_URL}" ]; then \
-		echo "⚠️  SOLANA_RPC_URL is not set in .env"; \
-	else \
+	@if grep -q "RPC_URLS=" .env && [ -n "$$(grep 'RPC_URLS=' .env | cut -d= -f2)" ]; then \
+		echo "✅ RPC_URLS is configured"; \
+	elif grep -q "SOLANA_RPC_URL=" .env && [ -n "$$(grep 'SOLANA_RPC_URL=' .env | cut -d= -f2)" ]; then \
 		echo "✅ SOLANA_RPC_URL is configured"; \
+	else \
+		echo "⚠️  No RPC URL configured in .env"; \
 	fi
 	@echo "✅ Validation complete"
+
+# Quick start - one command to rule them all
+start: up
+
+# Alias for make up-scaled
+production: up-scaled

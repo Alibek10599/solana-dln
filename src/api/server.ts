@@ -1,7 +1,7 @@
 /**
  * Dashboard API Server
  * 
- * Provides REST endpoints for the DLN dashboard frontend
+ * Provides REST endpoints and Server-Sent Events (SSE) for real-time updates
  */
 
 import 'dotenv/config';
@@ -24,12 +24,110 @@ import { getParseStats } from '../parser/transaction.js';
 const app = express();
 const PORT = parseInt(process.env.API_PORT || '3001');
 
+// =============================================================================
+// SSE Client Management
+// =============================================================================
+
+interface SSEClient {
+  id: string;
+  res: Response;
+}
+
+const sseClients: Map<string, SSEClient> = new Map();
+let sseUpdateInterval: NodeJS.Timeout | null = null;
+
+function generateClientId(): string {
+  return `client-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
+
+function broadcastToClients(event: string, data: any): void {
+  const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  
+  for (const [id, client] of sseClients) {
+    try {
+      client.res.write(message);
+    } catch (error) {
+      logger.debug({ clientId: id }, 'Failed to send to client, removing');
+      sseClients.delete(id);
+    }
+  }
+}
+
+async function fetchAndBroadcastUpdates(): Promise<void> {
+  if (sseClients.size === 0) return;
+  
+  try {
+    const [stats, createdProgress, fulfilledProgress, recentOrders] = await Promise.all([
+      getTotalStats(),
+      getCollectionProgress(DLN_SOURCE_PROGRAM_ID.toBase58(), 'created'),
+      getCollectionProgress(DLN_DESTINATION_PROGRAM_ID.toBase58(), 'fulfilled'),
+      getRecentOrders(10),
+    ]);
+    
+    const poolStats = getRpcPool().getStats();
+    const parseStats = getParseStats();
+    
+    broadcastToClients('update', {
+      stats: {
+        totalOrdersCreated: stats.total_created,
+        totalOrdersFulfilled: stats.total_fulfilled,
+        totalVolumeCreatedUsd: Number(stats.total_created_volume_usd) || 0,
+        totalVolumeFulfilledUsd: Number(stats.total_fulfilled_volume_usd) || 0,
+      },
+      collectionProgress: {
+        created: createdProgress.totalCollected,
+        fulfilled: fulfilledProgress.totalCollected,
+      },
+      recentOrders: recentOrders.slice(0, 5).map(o => ({
+        orderId: o.order_id,
+        eventType: o.event_type,
+        signature: o.signature,
+        blockTime: o.block_time,
+        giveTokenSymbol: o.give_token_symbol,
+        takeAmountUsd: o.take_amount_usd,
+      })),
+      rpcPool: {
+        healthyEndpoints: poolStats.healthyEndpoints,
+        totalEndpoints: poolStats.totalEndpoints,
+        totalRequests: poolStats.totalRequests,
+      },
+      parseStats: parseStats,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error({ error }, 'Failed to fetch SSE updates');
+  }
+}
+
+function startSSEUpdates(): void {
+  if (sseUpdateInterval) return;
+  
+  // Update every 2 seconds when clients are connected
+  sseUpdateInterval = setInterval(fetchAndBroadcastUpdates, 2000);
+  logger.info('SSE updates started');
+}
+
+function stopSSEUpdates(): void {
+  if (sseUpdateInterval) {
+    clearInterval(sseUpdateInterval);
+    sseUpdateInterval = null;
+    logger.info('SSE updates stopped');
+  }
+}
+
+// =============================================================================
 // Middleware
+// =============================================================================
+
 app.use(cors());
 app.use(express.json());
 
-// Request logging
+// Request logging (skip SSE to avoid log spam)
 app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.path === '/api/events') {
+    return next();
+  }
+  
   const start = Date.now();
   res.on('finish', () => {
     logger.info({
@@ -42,12 +140,70 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Error handler
+// Error handler wrapper
 function asyncHandler(fn: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response, next: NextFunction) => {
     Promise.resolve(fn(req, res)).catch(next);
   };
 }
+
+// =============================================================================
+// SSE Endpoint
+// =============================================================================
+
+/**
+ * Server-Sent Events endpoint for real-time updates
+ */
+app.get('/api/events', (req: Request, res: Response) => {
+  const clientId = generateClientId();
+  
+  // Set SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+  res.flushHeaders();
+  
+  // Send initial connection message
+  res.write(`event: connected\ndata: {"clientId": "${clientId}"}\n\n`);
+  
+  // Add client to list
+  sseClients.set(clientId, { id: clientId, res });
+  logger.info({ clientId, totalClients: sseClients.size }, 'SSE client connected');
+  
+  // Start updates if first client
+  if (sseClients.size === 1) {
+    startSSEUpdates();
+  }
+  
+  // Send immediate update
+  fetchAndBroadcastUpdates();
+  
+  // Heartbeat to keep connection alive
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`: heartbeat\n\n`);
+    } catch {
+      clearInterval(heartbeat);
+    }
+  }, 30000);
+  
+  // Clean up on disconnect
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sseClients.delete(clientId);
+    logger.info({ clientId, totalClients: sseClients.size }, 'SSE client disconnected');
+    
+    // Stop updates if no clients
+    if (sseClients.size === 0) {
+      stopSSEUpdates();
+    }
+  });
+});
+
+// =============================================================================
+// REST Endpoints
+// =============================================================================
 
 /**
  * Health check
@@ -213,7 +369,6 @@ app.get('/metrics', asyncHandler(async (req: Request, res: Response) => {
     '# TYPE dln_rpc_circuit_state gauge',
   ];
   
-  // Add per-endpoint metrics
   for (const [name, stats] of Object.entries(poolStats.endpoints)) {
     const stateValue = stats.circuitState === 'open' ? 1 : stats.circuitState === 'half-open' ? 0.5 : 0;
     lines.push(`dln_rpc_circuit_state{endpoint="${name}"} ${stateValue}`);
@@ -236,6 +391,11 @@ app.get('/metrics', asyncHandler(async (req: Request, res: Response) => {
       lines.push(`dln_rpc_latency_ms{endpoint="${name}"} ${stats.latencyMs}`);
     }
   }
+  
+  lines.push('');
+  lines.push('# HELP dln_sse_clients Number of connected SSE clients');
+  lines.push('# TYPE dln_sse_clients gauge');
+  lines.push(`dln_sse_clients ${sseClients.size}`);
   
   res.type('text/plain').send(lines.join('\n'));
 }));
@@ -294,7 +454,10 @@ app.get('/api/dashboard', asyncHandler(async (req: Request, res: Response) => {
   });
 }));
 
-// Error handler middleware
+// =============================================================================
+// Error Handler
+// =============================================================================
+
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
   logger.error({ error: err.message, stack: err.stack }, 'API Error');
   res.status(500).json({
@@ -303,15 +466,27 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
   });
 });
 
-// Start server
+// =============================================================================
+// Server Startup
+// =============================================================================
+
 const server = app.listen(PORT, () => {
   logger.info({ port: PORT }, 'API server started');
   logger.info(`Dashboard API available at http://localhost:${PORT}`);
+  logger.info(`SSE endpoint available at http://localhost:${PORT}/api/events`);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   logger.info('Shutting down...');
+  stopSSEUpdates();
+  
+  // Close all SSE connections
+  for (const [id, client] of sseClients) {
+    client.res.end();
+  }
+  sseClients.clear();
+  
   server.close();
   await closeClickHouse();
   process.exit(0);
@@ -319,6 +494,13 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
   logger.info('Shutting down...');
+  stopSSEUpdates();
+  
+  for (const [id, client] of sseClients) {
+    client.res.end();
+  }
+  sseClients.clear();
+  
   server.close();
   await closeClickHouse();
   process.exit(0);

@@ -3,12 +3,6 @@
  * 
  * Optimized for time-series analytics on DLN order events
  * with proper deduplication using ReplacingMergeTree.
- * 
- * KEY DESIGN DECISION:
- * - Created events have full USD data (parsed from instruction)
- * - Fulfilled events only have order_id and taker (minimal data from destination chain)
- * - Dashboard queries JOIN fulfilled with created to get USD values
- * - This avoids needing backfill scripts or complex parser logic
  */
 
 import { createClient, ClickHouseClient } from '@clickhouse/client';
@@ -59,7 +53,6 @@ export const SCHEMA = {
       slot UInt64,
       block_time DateTime,
       
-      -- Order creation fields (populated for 'created' events)
       maker Nullable(String),
       give_token_address Nullable(String),
       give_token_symbol Nullable(String),
@@ -74,8 +67,6 @@ export const SCHEMA = {
       take_chain_id Nullable(UInt64),
       
       receiver Nullable(String),
-      
-      -- Order fulfillment fields (populated for 'fulfilled' events)
       taker Nullable(String),
       fulfilled_amount Nullable(UInt128),
       fulfilled_amount_usd Nullable(Float64),
@@ -257,26 +248,31 @@ export async function getCollectionProgress(
 ): Promise<CollectionProgress> {
   const ch = getClickHouseClient();
   
-  const result = await ch.query({
-    query: `
-      SELECT last_signature, total_collected
-      FROM collection_progress FINAL
-      WHERE program_id = {programId: String} AND event_type = {eventType: String}
-    `,
-    query_params: { programId, eventType },
-    format: 'JSONEachRow',
-  });
-  
-  const rows = await result.json<{ last_signature: string; total_collected: number }>();
-  
-  if (rows.length === 0) {
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT last_signature, total_collected
+        FROM collection_progress FINAL
+        WHERE program_id = {programId: String} AND event_type = {eventType: String}
+      `,
+      query_params: { programId, eventType },
+      format: 'JSONEachRow',
+    });
+    
+    const rows = await result.json<{ last_signature: string; total_collected: number }>();
+    
+    if (rows.length === 0) {
+      return { lastSignature: null, totalCollected: 0 };
+    }
+    
+    return {
+      lastSignature: rows[0].last_signature || null,
+      totalCollected: rows[0].total_collected,
+    };
+  } catch (error) {
+    logger.error({ error }, 'Failed to get collection progress');
     return { lastSignature: null, totalCollected: 0 };
   }
-  
-  return {
-    lastSignature: rows[0].last_signature || null,
-    totalCollected: rows[0].total_collected,
-  };
 }
 
 export async function updateCollectionProgress(
@@ -308,31 +304,33 @@ export async function getUniqueOrderCount(
 ): Promise<number> {
   const ch = getClickHouseClient();
   
-  const whereClause = eventType 
-    ? `WHERE event_type = {eventType: String}` 
-    : '';
-  
-  const result = await ch.query({
-    query: `
-      SELECT count() as cnt
-      FROM orders FINAL
-      ${whereClause}
-    `,
-    query_params: eventType ? { eventType } : {},
-    format: 'JSONEachRow',
-  });
-  
-  const rows = await result.json<{ cnt: string }>();
-  return parseInt(rows[0]?.cnt || '0', 10);
+  try {
+    const whereClause = eventType 
+      ? `WHERE event_type = {eventType: String}` 
+      : '';
+    
+    const result = await ch.query({
+      query: `
+        SELECT count() as cnt
+        FROM orders FINAL
+        ${whereClause}
+      `,
+      query_params: eventType ? { eventType } : {},
+      format: 'JSONEachRow',
+    });
+    
+    const rows = await result.json<{ cnt: string }>();
+    return parseInt(rows[0]?.cnt || '0', 10);
+  } catch (error) {
+    logger.error({ error }, 'Failed to get unique order count');
+    return 0;
+  }
 }
 
 // =============================================================================
-// DASHBOARD QUERIES - JOIN fulfilled with created for USD values
+// DASHBOARD QUERIES - Simple and reliable
 // =============================================================================
 
-/**
- * Get daily volumes - JOIN fulfilled with created to get USD
- */
 export interface DailyVolume {
   date: string;
   created_count: number;
@@ -344,61 +342,32 @@ export interface DailyVolume {
 export async function getDailyVolumes(days: number = 30): Promise<DailyVolume[]> {
   const ch = getClickHouseClient();
   
-  // Query that joins fulfilled orders with their created orders to get USD values
-  const result = await ch.query({
-    query: `
-      WITH 
-        created_orders AS (
-          SELECT 
-            toDate(block_time) AS date,
-            order_id,
-            take_amount_usd
-          FROM orders FINAL
-          WHERE event_type = 'created'
-        ),
-        fulfilled_orders AS (
-          SELECT 
-            toDate(block_time) AS date,
-            order_id
-          FROM orders FINAL
-          WHERE event_type = 'fulfilled'
-        ),
-        -- Get USD for fulfilled by joining with created
-        fulfilled_with_usd AS (
-          SELECT 
-            f.date,
-            coalesce(c.take_amount_usd, 0) AS volume_usd
-          FROM fulfilled_orders f
-          LEFT JOIN created_orders c ON f.order_id = c.order_id
-        )
-      SELECT
-        date,
-        -- Created stats (direct from created_orders)
-        (SELECT count() FROM created_orders WHERE created_orders.date = dates.date) AS created_count,
-        (SELECT coalesce(sum(take_amount_usd), 0) FROM created_orders WHERE created_orders.date = dates.date) AS created_volume_usd,
-        -- Fulfilled stats (USD from joined data)
-        (SELECT count() FROM fulfilled_orders WHERE fulfilled_orders.date = dates.date) AS fulfilled_count,
-        (SELECT coalesce(sum(volume_usd), 0) FROM fulfilled_with_usd WHERE fulfilled_with_usd.date = dates.date) AS fulfilled_volume_usd
-      FROM (
-        SELECT DISTINCT date FROM (
-          SELECT date FROM created_orders
-          UNION ALL
-          SELECT date FROM fulfilled_orders
-        )
-      ) AS dates
-      WHERE date >= today() - {days: UInt32}
-      ORDER BY date ASC
-    `,
-    query_params: { days },
-    format: 'JSONEachRow',
-  });
-  
-  return result.json<DailyVolume>();
+  try {
+    // Simple query - get counts and volumes per day per event type
+    const result = await ch.query({
+      query: `
+        SELECT
+          toDate(block_time) AS date,
+          countIf(event_type = 'created') AS created_count,
+          coalesce(sumIf(take_amount_usd, event_type = 'created'), 0) AS created_volume_usd,
+          countIf(event_type = 'fulfilled') AS fulfilled_count,
+          coalesce(sumIf(take_amount_usd, event_type = 'fulfilled'), 0) AS fulfilled_volume_usd
+        FROM orders FINAL
+        WHERE block_time >= today() - toIntervalDay({days: UInt32})
+        GROUP BY date
+        ORDER BY date ASC
+      `,
+      query_params: { days },
+      format: 'JSONEachRow',
+    });
+    
+    return result.json<DailyVolume>();
+  } catch (error) {
+    logger.error({ error }, 'Failed to get daily volumes');
+    return [];
+  }
 }
 
-/**
- * Get total statistics - JOIN fulfilled with created for USD
- */
 export interface TotalStats {
   total_created: number;
   total_fulfilled: number;
@@ -409,45 +378,39 @@ export interface TotalStats {
 export async function getTotalStats(): Promise<TotalStats> {
   const ch = getClickHouseClient();
 
-  const result = await ch.query({
-    query: `
-      WITH 
-        created AS (
-          SELECT order_id, take_amount_usd
-          FROM orders FINAL
-          WHERE event_type = 'created'
-        ),
-        fulfilled AS (
-          SELECT order_id
-          FROM orders FINAL
-          WHERE event_type = 'fulfilled'
-        )
-      SELECT
-        (SELECT count() FROM created) AS total_created,
-        (SELECT count() FROM fulfilled) AS total_fulfilled,
-        (SELECT coalesce(sum(take_amount_usd), 0) FROM created) AS total_created_volume_usd,
-        -- Fulfilled USD = sum of take_amount_usd from matching created orders
-        (
-          SELECT coalesce(sum(c.take_amount_usd), 0)
-          FROM fulfilled f
-          LEFT JOIN created c ON f.order_id = c.order_id
-        ) AS total_fulfilled_volume_usd
-    `,
-    format: 'JSONEachRow',
-  });
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT
+          countIf(event_type = 'created') AS total_created,
+          countIf(event_type = 'fulfilled') AS total_fulfilled,
+          coalesce(sumIf(take_amount_usd, event_type = 'created'), 0) AS total_created_volume_usd,
+          coalesce(sumIf(take_amount_usd, event_type = 'fulfilled'), 0) AS total_fulfilled_volume_usd
+        FROM orders FINAL
+      `,
+      format: 'JSONEachRow',
+    });
 
-  const rows = await result.json<TotalStats>();
-  return rows[0] || {
-    total_created: 0,
-    total_fulfilled: 0,
-    total_created_volume_usd: 0,
-    total_fulfilled_volume_usd: 0,
-  };
+    const rows = await result.json<TotalStats>();
+    const row = rows[0];
+    
+    return {
+      total_created: Number(row?.total_created) || 0,
+      total_fulfilled: Number(row?.total_fulfilled) || 0,
+      total_created_volume_usd: Number(row?.total_created_volume_usd) || 0,
+      total_fulfilled_volume_usd: Number(row?.total_fulfilled_volume_usd) || 0,
+    };
+  } catch (error) {
+    logger.error({ error }, 'Failed to get total stats');
+    return {
+      total_created: 0,
+      total_fulfilled: 0,
+      total_created_volume_usd: 0,
+      total_fulfilled_volume_usd: 0,
+    };
+  }
 }
 
-/**
- * Get top tokens by volume (from created orders)
- */
 export interface TokenStat {
   symbol: string;
   order_count: number;
@@ -457,30 +420,32 @@ export interface TokenStat {
 export async function getTopTokens(limit: number = 10): Promise<TokenStat[]> {
   const ch = getClickHouseClient();
 
-  const result = await ch.query({
-    query: `
-      SELECT
-        give_token_symbol AS symbol,
-        count() AS order_count,
-        coalesce(sum(give_amount_usd), 0) AS volume_usd
-      FROM orders FINAL
-      WHERE event_type = 'created' 
-        AND give_token_symbol IS NOT NULL 
-        AND give_token_symbol != ''
-      GROUP BY symbol
-      ORDER BY volume_usd DESC
-      LIMIT {limit: UInt32}
-    `,
-    query_params: { limit },
-    format: 'JSONEachRow',
-  });
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT
+          give_token_symbol AS symbol,
+          count() AS order_count,
+          coalesce(sum(give_amount_usd), 0) AS volume_usd
+        FROM orders FINAL
+        WHERE event_type = 'created' 
+          AND give_token_symbol IS NOT NULL 
+          AND give_token_symbol != ''
+        GROUP BY symbol
+        ORDER BY volume_usd DESC
+        LIMIT {limit: UInt32}
+      `,
+      query_params: { limit },
+      format: 'JSONEachRow',
+    });
 
-  return result.json<TokenStat>();
+    return result.json<TokenStat>();
+  } catch (error) {
+    logger.error({ error }, 'Failed to get top tokens');
+    return [];
+  }
 }
 
-/**
- * Get recent orders with USD values
- */
 export interface RecentOrder {
   order_id: string;
   event_type: string;
@@ -497,71 +462,60 @@ export interface RecentOrder {
 export async function getRecentOrders(limit: number = 50): Promise<RecentOrder[]> {
   const ch = getClickHouseClient();
   
-  // For fulfilled orders, join with created to get token info
-  const result = await ch.query({
-    query: `
-      WITH created_data AS (
-        SELECT 
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT
           order_id,
+          event_type,
+          signature,
+          block_time,
           give_token_symbol,
           give_amount_usd,
           take_token_symbol,
           take_amount_usd,
-          maker
+          maker,
+          taker
         FROM orders FINAL
-        WHERE event_type = 'created'
-      )
-      SELECT
-        o.order_id,
-        o.event_type,
-        o.signature,
-        o.block_time,
-        -- For created: use own data, for fulfilled: join with created
-        if(o.event_type = 'created', o.give_token_symbol, c.give_token_symbol) AS give_token_symbol,
-        if(o.event_type = 'created', o.give_amount_usd, c.give_amount_usd) AS give_amount_usd,
-        if(o.event_type = 'created', o.take_token_symbol, c.take_token_symbol) AS take_token_symbol,
-        if(o.event_type = 'created', o.take_amount_usd, c.take_amount_usd) AS take_amount_usd,
-        if(o.event_type = 'created', o.maker, c.maker) AS maker,
-        o.taker
-      FROM orders FINAL AS o
-      LEFT JOIN created_data c ON o.order_id = c.order_id AND o.event_type = 'fulfilled'
-      ORDER BY o.block_time DESC
-      LIMIT {limit: UInt32}
-    `,
-    query_params: { limit },
-    format: 'JSONEachRow',
-  });
-  
-  return result.json<RecentOrder>();
+        ORDER BY block_time DESC
+        LIMIT {limit: UInt32}
+      `,
+      query_params: { limit },
+      format: 'JSONEachRow',
+    });
+    
+    return result.json<RecentOrder>();
+  } catch (error) {
+    logger.error({ error }, 'Failed to get recent orders');
+    return [];
+  }
 }
 
-/**
- * Check if order event exists
- */
 export async function orderEventExists(
   signature: string, 
   eventType: 'created' | 'fulfilled'
 ): Promise<boolean> {
   const ch = getClickHouseClient();
   
-  const result = await ch.query({
-    query: `
-      SELECT 1
-      FROM orders FINAL
-      WHERE signature = {signature: String} AND event_type = {eventType: String}
-      LIMIT 1
-    `,
-    query_params: { signature, eventType },
-    format: 'JSONEachRow',
-  });
-  
-  const rows = await result.json();
-  return rows.length > 0;
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT 1
+        FROM orders FINAL
+        WHERE signature = {signature: String} AND event_type = {eventType: String}
+        LIMIT 1
+      `,
+      query_params: { signature, eventType },
+      format: 'JSONEachRow',
+    });
+    
+    const rows = await result.json();
+    return rows.length > 0;
+  } catch (error) {
+    return false;
+  }
 }
 
-/**
- * Force optimization (merge) of the orders table
- */
 export async function optimizeOrdersTable(): Promise<void> {
   const ch = getClickHouseClient();
   
