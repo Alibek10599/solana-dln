@@ -13,7 +13,7 @@ export function useDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [isLive, setIsLive] = useState(true);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const intervalRef = useRef<number | null>(null);
 
   const fetchData = useCallback(async (silent = false) => {
     try {
@@ -82,10 +82,10 @@ export function useDashboard() {
 
   useEffect(() => {
     // Initial fetch
-    fetchData().then(isComplete => {
+    fetchData().then((isComplete: boolean) => {
       startLiveUpdates(isComplete);
     });
-    
+
     return () => {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);

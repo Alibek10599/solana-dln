@@ -246,21 +246,17 @@ temporal-admin:
 # Local Development (without Docker for app, with Docker for infra)
 # =============================================================================
 
-# Run API locally
+# Run API locally (requires: make dev)
 run-api:
 	npm run api
 
-# Run worker locally
+# Run Temporal worker locally (requires: make dev)
 run-worker:
-	npm run temporal:worker
+	npm run worker
 
 # Run dashboard locally
 run-dashboard:
 	npm run dashboard
-
-# Run simple collector (non-Temporal)
-run-collect:
-	npm run collect
 
 # =============================================================================
 # Utilities

@@ -3,7 +3,7 @@ import { StatsCards } from './components/StatsCards';
 import { VolumeChart } from './components/VolumeChart';
 import { TopTokens } from './components/TopTokens';
 import { RecentOrdersTable } from './components/RecentOrdersTable';
-import { RefreshCw, AlertCircle, Radio, RadioOff } from 'lucide-react';
+import { RefreshCw, AlertCircle, CircleDot, Circle } from 'lucide-react';
 
 function App() {
   const { data, loading, error, refresh, isLive, toggleLive, lastUpdate } =
@@ -80,12 +80,12 @@ function App() {
             >
               {isLive ? (
                 <>
-                  <Radio className='w-4 h-4 animate-pulse' />
+                  <CircleDot className='w-4 h-4 animate-pulse' />
                   <span className='text-sm'>LIVE</span>
                 </>
               ) : (
                 <>
-                  <RadioOff className='w-4 h-4' />
+                  <Circle className='w-4 h-4' />
                   <span className='text-sm'>PAUSED</span>
                 </>
               )}

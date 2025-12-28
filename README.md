@@ -138,32 +138,40 @@ npm run migrate
 # Note: 'make up' runs this automatically, but for local dev you need to run it manually
 ```
 
-### 5. Collect Data
+### 5. Start Services
 
 ```bash
-npm run collect
+# Terminal 1: Start API server
+npm run api
+
+# Terminal 2: Start Temporal worker
+npm run worker
+
+# Terminal 3: Start dashboard
+npm run dashboard
 ```
 
-This will:
+### 6. Start Collection
+
+Use Makefile commands to manage the Temporal workflow:
+
+```bash
+make collect  # Start collection workflow
+make watch    # Watch progress
+make status   # Check status
+```
+
+The collection workflow will:
 - Fetch transaction signatures from DlnSource and DlnDestination programs
 - Parse transactions using low-level Borsh deserialization
 - Deduplicate events before insertion
 - Store in ClickHouse with progress checkpointing
 - Resume automatically if interrupted
 
-### 6. Start API Server
-
-```bash
-npm run api
-```
-
-### 7. Start Dashboard
-
-```bash
-npm run dashboard
-```
-
-Open http://localhost:3000 in your browser.
+**Access the services:**
+- Dashboard: http://localhost:3000
+- API: http://localhost:3001
+- Temporal UI: http://localhost:8233
 
 ## Project Structure
 
@@ -333,17 +341,20 @@ ORDER BY (signature, event_type)  -- Deduplication key
 ## Development
 
 ```bash
-# Run collector with hot reload
-npx tsx watch src/collector/index.ts
+# Start infrastructure
+make dev
 
 # Run API with hot reload
 npx tsx watch src/api/server.ts
 
+# Run Temporal worker with hot reload
+npx tsx watch src/temporal/worker.ts
+
 # Run dashboard dev server
-cd dashboard && npm run dev
+npm run dashboard
 ```
 
-## Temporal-Based Collection (Recommended for Production)
+## Temporal Workflow Collection
 
 For production systems, the project includes a **Temporal-based collector** with:
 
@@ -355,25 +366,19 @@ For production systems, the project includes a **Temporal-based collector** with
 - **Queryable State** - Check progress anytime via queries
 - **Pause/Resume** - Control collection via signals
 
-### Temporal Quick Start
+### Temporal Quick Start (Docker)
 
 ```bash
-# 1. Start all services (ClickHouse + Temporal + UI)
-docker-compose up -d
+# Start all services (includes migrations)
+make up
 
-# 2. Wait for Temporal to be ready (~30 seconds)
-docker-compose logs -f temporal
+# Start collection workflow
+make collect
 
-# 3. Start the worker (handles all queues)
-npm run temporal:worker
+# Watch progress
+make watch
 
-# 4. Start the collection workflow
-npm run temporal:start
-
-# 5. Watch progress (auto-refresh)
-npm run temporal:watch
-
-# 6. View in Temporal UI
+# View in Temporal UI
 open http://localhost:8233
 ```
 
@@ -381,16 +386,19 @@ open http://localhost:8233
 
 | Command | Description |
 |---------|-------------|
-| `npm run temporal:worker` | Start full worker (all queues) |
-| `npm run temporal:worker:rpc` | Start RPC-only worker |
-| `npm run temporal:worker:db` | Start DB-only worker |
-| `npm run temporal:start` | Start collection workflow |
-| `npm run temporal:status` | Check progress |
-| `npm run temporal:watch` | Watch progress (auto-refresh) |
-| `npm run temporal:pause` | Pause collection |
-| `npm run temporal:resume` | Resume collection |
-| `npm run temporal:cancel` | Cancel collection |
-| `npm run temporal:health` | Run health check |
+| `make collect` | Start collection workflow |
+| `make status` | Check collection status |
+| `make watch` | Watch progress (auto-refresh) |
+| `make pause` | Pause collection |
+| `make resume` | Resume collection |
+| `make cancel` | Cancel collection |
+
+**For local development:**
+```bash
+make dev          # Start infrastructure only
+npm run worker    # Start Temporal worker locally
+make collect      # Start collection workflow
+```
 
 ### Temporal Architecture
 
@@ -452,20 +460,36 @@ open http://localhost:8233
 
 **Development (single machine):**
 ```bash
-# Full worker handles everything
-npm run temporal:worker
+# Docker: Start with all services
+make up
+
+# Local: Start infrastructure + worker
+make dev
+npm run worker
+```
+
+**Production (Docker with scaled workers):**
+```bash
+# Start with scaled workers and monitoring
+make up-scaled
+
+# This automatically starts:
+# - 1x Full worker (workflows + all activities)
+# - 2x RPC workers (rate-limited Solana operations)
+# - 2x DB workers (high-throughput database operations)
+# - Prometheus + Grafana for monitoring
 ```
 
 **Production (multiple machines):**
 ```bash
-# Machine 1: Workflow coordinator + DB activities
-WORKER_MODE=full npm run temporal:worker
+# Machine 1: Main worker
+WORKER_MODE=full npm run worker
 
-# Machine 2-N: Dedicated RPC workers (rate limited)
-WORKER_MODE=rpc WORKER_ACTIVITIES_PER_SECOND=10 npm run temporal:worker
+# Machine 2-N: RPC workers (rate limited)
+WORKER_MODE=rpc WORKER_ACTIVITIES_PER_SECOND=10 npm run worker
 
-# Machine N+1: Dedicated DB worker (high throughput)
-WORKER_MODE=db WORKER_MAX_ACTIVITIES=20 npm run temporal:worker
+# Machine N+1: DB worker (high throughput)
+WORKER_MODE=db WORKER_MAX_ACTIVITIES=20 npm run worker
 ```
 
 ### Worker Configuration

@@ -6,24 +6,10 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
-    "collect": "tsx src/collector/index.ts",
-    "api": "tsx src/api/server.ts",
     "migrate": "tsx src/db/migrate.ts",
-    "dashboard": "cd dashboard && npm run dev",
-    "install:all": "npm install && cd dashboard && npm install",
-    
-    "temporal:worker": "tsx src/temporal/worker.ts",
-    "temporal:worker:rpc": "WORKER_MODE=rpc tsx src/temporal/worker.ts",
-    "temporal:worker:db": "WORKER_MODE=db tsx src/temporal/worker.ts",
-    "temporal:start": "tsx src/temporal/client.ts start",
-    "temporal:status": "tsx src/temporal/client.ts status",
-    "temporal:watch": "tsx src/temporal/client.ts watch",
-    "temporal:pause": "tsx src/temporal/client.ts pause",
-    "temporal:resume": "tsx src/temporal/client.ts resume",
-    "temporal:cancel": "tsx src/temporal/client.ts cancel",
-    "temporal:health": "tsx src/temporal/client.ts health"
+    "api": "tsx src/api/server.ts",
+    "worker": "tsx src/temporal/worker.ts",
+    "dashboard": "cd dashboard && npm run dev"
   },
   "keywords": [
     "solana",
