@@ -372,10 +372,10 @@ function resolveTokenSymbol(address: string): string | undefined {
 }
 
 /**
- * Calculate USD value (simplified)
- * 
- * In production, you'd use price feeds (CoinGecko, Jupiter, etc.)
- * For now, we assume stablecoins = $1 and use rough estimates
+ * Calculate USD value using estimated prices
+ *
+ * Uses estimated prices from KNOWN_TOKENS mapping.
+ * TODO: Replace with real-time price feed (CoinGecko, Jupiter, etc.)
  */
 function calculateUsdValue(
   tokenAddress: string,
@@ -383,22 +383,26 @@ function calculateUsdValue(
   symbol?: string
 ): number | undefined {
   const tokenInfo = KNOWN_TOKENS[tokenAddress];
-  
+
   if (!tokenInfo) {
     // Unknown token - can't calculate USD value without price feed
     return undefined;
   }
-  
+
   const decimals = tokenInfo.decimals;
   const rawAmount = Number(amount) / Math.pow(10, decimals);
-  
-  // For stablecoins, 1:1 USD
-  if (symbol === 'USDC' || symbol === 'USDT') {
+
+  // Use estimated price if available
+  if (tokenInfo.estimatedPrice !== undefined) {
+    return rawAmount * tokenInfo.estimatedPrice;
+  }
+
+  // Fallback: for stablecoins without estimated price, assume 1:1 USD
+  if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'DAI') {
     return rawAmount;
   }
-  
-  // For other tokens, we'd need a price feed
-  // For demo purposes, skip USD calculation for non-stables
+
+  // No price available
   return undefined;
 }
 

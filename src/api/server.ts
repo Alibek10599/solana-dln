@@ -59,14 +59,14 @@ app.get('/health', (req: Request, res: Response) => {
  */
 app.get('/api/stats', asyncHandler(async (req: Request, res: Response) => {
   const stats = await getTotalStats();
-  
+
   res.json({
     success: true,
     data: {
       totalOrdersCreated: stats.total_created,
       totalOrdersFulfilled: stats.total_fulfilled,
-      totalVolumeCreatedUsd: stats.total_created_volume_usd || 0,
-      totalVolumeFulfilledUsd: stats.total_fulfilled_volume_usd || 0,
+      totalVolumeCreatedUsd: Number(stats.total_created_volume_usd) || 0,
+      totalVolumeFulfilledUsd: Number(stats.total_fulfilled_volume_usd) || 0,
     },
   });
 }));
@@ -174,8 +174,8 @@ app.get('/api/dashboard', asyncHandler(async (req: Request, res: Response) => {
       stats: {
         totalOrdersCreated: stats.total_created,
         totalOrdersFulfilled: stats.total_fulfilled,
-        totalVolumeCreatedUsd: stats.total_created_volume_usd || 0,
-        totalVolumeFulfilledUsd: stats.total_fulfilled_volume_usd || 0,
+        totalVolumeCreatedUsd: Number(stats.total_created_volume_usd) || 0,
+        totalVolumeFulfilledUsd: Number(stats.total_fulfilled_volume_usd) || 0,
       },
       dailyVolumes: volumes.map(v => ({
         date: v.date,

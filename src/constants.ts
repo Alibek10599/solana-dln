@@ -10,17 +10,29 @@ export const DLN_DESTINATION_PROGRAM_ID = new PublicKey('dst5MGcFPoBeREFAA5E3tU5
 /**
  * Known token mints for price resolution
  */
-export const KNOWN_TOKENS: Record<string, { symbol: string; decimals: number; coingeckoId?: string }> = {
-  // Native SOL (wrapped)
-  'So11111111111111111111111111111111111111112': { symbol: 'SOL', decimals: 9, coingeckoId: 'solana' },
-  // USDC on Solana
-  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': { symbol: 'USDC', decimals: 6, coingeckoId: 'usd-coin' },
-  // USDT on Solana
-  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': { symbol: 'USDT', decimals: 6, coingeckoId: 'tether' },
-  // debridge ETH
-  'EjmyN6qEC1Tf1JxiG1ae7UTJhUxSwk1TCCb39Xo6rZNH': { symbol: 'ETH', decimals: 8, coingeckoId: 'ethereum' },
-  // WBTC (debridge)
-  '3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh': { symbol: 'WBTC', decimals: 8, coingeckoId: 'wrapped-bitcoin' },
+export const KNOWN_TOKENS: Record<string, { symbol: string; decimals: number; coingeckoId?: string; estimatedPrice?: number }> = {
+  // Native Solana tokens
+  'So11111111111111111111111111111111111111112': { symbol: 'SOL', decimals: 9, coingeckoId: 'solana', estimatedPrice: 180 },
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': { symbol: 'USDC', decimals: 6, coingeckoId: 'usd-coin', estimatedPrice: 1 },
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': { symbol: 'USDT', decimals: 6, coingeckoId: 'tether', estimatedPrice: 1 },
+  'EjmyN6qEC1Tf1JxiG1ae7UTJhUxSwk1TCCb39Xo6rZNH': { symbol: 'ETH', decimals: 8, coingeckoId: 'ethereum', estimatedPrice: 3300 },
+  '3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh': { symbol: 'WBTC', decimals: 8, coingeckoId: 'wrapped-bitcoin', estimatedPrice: 95000 },
+
+  // DLN External Token Representations (most common from database)
+  // These are DLN's representations of tokens from other chains
+  '2M59vuWgsiuHAqQVB6KvuXuaBCJR8138gMAm4uCuR6Du': { symbol: 'USDC', decimals: 6, coingeckoId: 'usd-coin', estimatedPrice: 1 },
+  '2M59vwAZjmxdjuFoHN4LPF6V884pXaVd4tFAPfNHcbhH': { symbol: 'USDT', decimals: 6, coingeckoId: 'tether', estimatedPrice: 1 },
+  '2M59vwKQJKZmd3tzArBHGeyBpXNkrxVuJ4nbSzyvLSLf': { symbol: 'ETH', decimals: 18, coingeckoId: 'ethereum', estimatedPrice: 3300 },
+  '2M59vwmBk7XwzDiNXD8m2aMYLdC8asEZ78mcVkTJJxVu': { symbol: 'ETH', decimals: 18, coingeckoId: 'ethereum', estimatedPrice: 3300 },
+  '2M59vvrxfJjQvkVrRcaukiLMDLyAVkVStsdo3TzncnFR': { symbol: 'USDC', decimals: 6, coingeckoId: 'usd-coin', estimatedPrice: 1 },
+  '2M59vw3yujSFV1eVfmv5Af3UCe1FbkSAYpwaB15ZRghu': { symbol: 'USDC', decimals: 6, coingeckoId: 'usd-coin', estimatedPrice: 1 },
+  '2M59vv8eoRXMEVD8Wmb9RtvYdgx3WvgmNU9dvcHk55bm': { symbol: 'ETH', decimals: 18, coingeckoId: 'ethereum', estimatedPrice: 3300 },
+  '2M59vv9Ub5R2Upy8RdJanjAjy1NAysXCViLtRTzNDBwD': { symbol: 'USDC', decimals: 6, coingeckoId: 'usd-coin', estimatedPrice: 1 },
+  '2M59vvcYYyHFQYh6oLvg2z8q1aqoa1LrNLQZqU4ZKPoD': { symbol: 'USDT', decimals: 6, coingeckoId: 'tether', estimatedPrice: 1 },
+  '2M59vvbm5H6PgSnLrJ4enUh2dkwQRPPYnXYcduwW348X': { symbol: 'USDC', decimals: 6, coingeckoId: 'usd-coin', estimatedPrice: 1 },
+  '2M59vvazzYMLDTQ8baypEm43JvVgWwYWEUHWkYHWfRaf': { symbol: 'ETH', decimals: 18, coingeckoId: 'ethereum', estimatedPrice: 3300 },
+  '2M59vuaiieUr7KrPTJkcMSB1jVcB8FRLZ1jRYLNzvAeb': { symbol: 'USDC', decimals: 6, coingeckoId: 'usd-coin', estimatedPrice: 1 },
+  '2M59vw23JFxr587GK7gjf7mnWF98NHq1t1Uy2zEdx9vf': { symbol: 'USDC', decimals: 6, coingeckoId: 'usd-coin', estimatedPrice: 1 },
 };
 
 /**

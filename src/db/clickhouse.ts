@@ -469,19 +469,19 @@ export interface TotalStats {
 
 export async function getTotalStats(): Promise<TotalStats> {
   const ch = getClickHouseClient();
-  
+
   const result = await ch.query({
     query: `
       SELECT
         countIf(event_type = 'created') AS total_created,
         countIf(event_type = 'fulfilled') AS total_fulfilled,
-        sumIf(give_amount_usd, event_type = 'created') AS total_created_volume_usd,
+        sumIf(take_amount_usd, event_type = 'created') AS total_created_volume_usd,
         sumIf(fulfilled_amount_usd, event_type = 'fulfilled') AS total_fulfilled_volume_usd
       FROM orders FINAL
     `,
     format: 'JSONEachRow',
   });
-  
+
   const rows = await result.json<TotalStats>();
   return rows[0] || {
     total_created: 0,

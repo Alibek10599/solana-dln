@@ -9,25 +9,30 @@
  */
 
 import pino from 'pino';
+import pretty from 'pino-pretty';
 import { config } from '../config/index.js';
 
 /**
  * Base logger instance
  */
-export const logger = pino({
-  level: config.logging.level,
-  ...(config.logging.prettyPrint && {
-    transport: {
-      target: 'pino-pretty',
-      options: {
+export const logger = config.logging.prettyPrint
+  ? pino(
+      {
+        level: config.logging.level,
+      },
+      pretty({
         colorize: true,
         translateTime: 'SYS:standard',
         ignore: 'pid,hostname',
         singleLine: false,
-      },
-    },
-  }),
-});
+        // Custom colors for different log levels
+        customColors: 'trace:gray,debug:blue,info:green,warn:yellow,error:red,fatal:redBright',
+        sync: false,
+      })
+    )
+  : pino({
+      level: config.logging.level,
+    });
 
 /**
  * Create a child logger for a specific component
