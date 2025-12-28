@@ -229,7 +229,10 @@ export async function insertOrderEvents(events: OrderEvent[]): Promise<number> {
   const ch = getClickHouseClient();
   
   // Convert to ClickHouse format
-  // Note: BigInt values are kept as-is - ClickHouse client handles serialization
+  // Convert BigInt to Number - safe for token amounts (typically < 2^53)
+  // Chain IDs: Keep only if they fit in UInt64 range, otherwise null
+  const MAX_UINT64 = 18446744073709551615n;
+
   const rows = events.map(e => ({
     order_id: e.order_id,
     event_type: e.event_type,
@@ -239,24 +242,34 @@ export async function insertOrderEvents(events: OrderEvent[]): Promise<number> {
     maker: e.maker || null,
     give_token_address: e.give_token_address || null,
     give_token_symbol: e.give_token_symbol || null,
-    give_amount: e.give_amount || null, // Keep as BigInt - client serializes it
+    give_amount: e.give_amount ? Number(e.give_amount) : null,
     give_amount_usd: e.give_amount_usd || null,
-    give_chain_id: e.give_chain_id || null,
+    // Chain ID: Only include if it fits in UInt64, otherwise null
+    give_chain_id: (e.give_chain_id && e.give_chain_id <= MAX_UINT64) ? Number(e.give_chain_id) : null,
     take_token_address: e.take_token_address || null,
     take_token_symbol: e.take_token_symbol || null,
-    take_amount: e.take_amount || null, // Keep as BigInt
+    take_amount: e.take_amount ? Number(e.take_amount) : null,
     take_amount_usd: e.take_amount_usd || null,
-    take_chain_id: e.take_chain_id || null,
+    // Chain ID: Only include if it fits in UInt64, otherwise null
+    take_chain_id: (e.take_chain_id && e.take_chain_id <= MAX_UINT64) ? Number(e.take_chain_id) : null,
     receiver: e.receiver || null,
     taker: e.taker || null,
-    fulfilled_amount: e.fulfilled_amount || null, // Keep as BigInt
+    fulfilled_amount: e.fulfilled_amount ? Number(e.fulfilled_amount) : null,
     fulfilled_amount_usd: e.fulfilled_amount_usd || null,
   }));
+
+  // Debug log first row if event_type is 'created'
+  if (events.length > 0 && events[0].event_type === 'created') {
+    logger.debug({ sample: rows[0], count: rows.length }, 'Inserting created events');
+  }
   
   await ch.insert({
     table: 'orders',
     values: rows,
     format: 'JSONEachRow',
+    clickhouse_settings: {
+      input_format_skip_unknown_fields: 1,
+    },
   });
   
   // ReplacingMergeTree handles deduplication automatically
