@@ -2,7 +2,13 @@
  * ClickHouse Database Client and Schema
  * 
  * Optimized for time-series analytics on DLN order events
- * with proper deduplication using ReplacingMergeTree
+ * with proper deduplication using ReplacingMergeTree.
+ * 
+ * KEY DESIGN DECISION:
+ * - Created events have full USD data (parsed from instruction)
+ * - Fulfilled events only have order_id and taker (minimal data from destination chain)
+ * - Dashboard queries JOIN fulfilled with created to get USD values
+ * - This avoids needing backfill scripts or complex parser logic
  */
 
 import { createClient, ClickHouseClient } from '@clickhouse/client';
@@ -43,21 +49,12 @@ export async function closeClickHouse(): Promise<void> {
 
 /**
  * ClickHouse Schema for DLN Orders
- * 
- * Using ReplacingMergeTree for automatic deduplication based on (signature, event_type)
  */
 export const SCHEMA = {
-  /**
-   * Main orders table with ReplacingMergeTree for deduplication
-   * Duplicates are merged in background based on ORDER BY key
-   */
   ordersTable: `
     CREATE TABLE IF NOT EXISTS orders (
-      -- Event identification
       order_id String,
       event_type Enum8('created' = 1, 'fulfilled' = 2),
-      
-      -- Transaction info (signature + event_type = unique key)
       signature String,
       slot UInt64,
       block_time DateTime,
@@ -83,10 +80,7 @@ export const SCHEMA = {
       fulfilled_amount Nullable(UInt128),
       fulfilled_amount_usd Nullable(Float64),
       
-      -- Metadata
       created_at DateTime DEFAULT now(),
-      
-      -- Version for ReplacingMergeTree (higher = newer)
       _version UInt64 DEFAULT toUnixTimestamp(now())
     )
     ENGINE = ReplacingMergeTree(_version)
@@ -95,44 +89,6 @@ export const SCHEMA = {
     SETTINGS index_granularity = 8192
   `,
 
-  /**
-   * Materialized view for daily volumes
-   * Pre-aggregates data for fast dashboard queries
-   */
-  dailyVolumesMV: `
-    CREATE MATERIALIZED VIEW IF NOT EXISTS daily_volumes_mv
-    ENGINE = SummingMergeTree()
-    PARTITION BY toYYYYMM(date)
-    ORDER BY (date, event_type)
-    AS SELECT
-      toDate(block_time) AS date,
-      event_type,
-      count() AS order_count,
-      sum(coalesce(give_amount_usd, fulfilled_amount_usd, 0)) AS volume_usd
-    FROM orders
-    GROUP BY date, event_type
-  `,
-
-  /**
-   * Materialized view for token statistics
-   */
-  tokenStatsMV: `
-    CREATE MATERIALIZED VIEW IF NOT EXISTS token_stats_mv
-    ENGINE = SummingMergeTree()
-    PARTITION BY tuple()
-    ORDER BY (symbol)
-    AS SELECT
-      assumeNotNull(give_token_symbol) AS symbol,
-      count() AS order_count,
-      sum(give_amount_usd) AS volume_usd
-    FROM orders
-    WHERE event_type = 'created' AND give_token_symbol IS NOT NULL
-    GROUP BY symbol
-  `,
-
-  /**
-   * Collection progress tracking table
-   */
   collectionProgressTable: `
     CREATE TABLE IF NOT EXISTS collection_progress (
       program_id String,
@@ -152,7 +108,6 @@ export const SCHEMA = {
 export async function initializeSchema(): Promise<void> {
   const ch = getClickHouseClient();
   
-  // Create database if not exists (need to connect without database first)
   const dbName = process.env.CLICKHOUSE_DATABASE || 'dln_dashboard';
   
   const rootClient = createClient({
@@ -170,15 +125,8 @@ export async function initializeSchema(): Promise<void> {
     await rootClient.close();
   }
   
-  // Create tables
   logger.info('Creating orders table...');
   await ch.command({ query: SCHEMA.ordersTable });
-  
-  logger.info('Creating daily volumes materialized view...');
-  await ch.command({ query: SCHEMA.dailyVolumesMV });
-  
-  logger.info('Creating token stats materialized view...');
-  await ch.command({ query: SCHEMA.tokenStatsMV });
   
   logger.info('Creating collection progress table...');
   await ch.command({ query: SCHEMA.collectionProgressTable });
@@ -196,7 +144,6 @@ export interface OrderEvent {
   slot: number;
   block_time: Date;
   
-  // Created event fields
   maker?: string;
   give_token_address?: string;
   give_token_symbol?: string;
@@ -211,26 +158,18 @@ export interface OrderEvent {
   take_chain_id?: number;
   
   receiver?: string;
-  
-  // Fulfilled event fields
   taker?: string;
   fulfilled_amount?: bigint;
   fulfilled_amount_usd?: number;
 }
 
 /**
- * Insert order events in batch (with deduplication check)
- * 
- * @returns Number of new events inserted (excluding duplicates)
+ * Insert order events in batch
  */
 export async function insertOrderEvents(events: OrderEvent[]): Promise<number> {
   if (events.length === 0) return 0;
   
   const ch = getClickHouseClient();
-  
-  // Convert to ClickHouse format
-  // Convert BigInt to Number - safe for token amounts (typically < 2^53)
-  // Chain IDs: Keep only if they fit in UInt64 range, otherwise null
   const MAX_UINT64 = 18446744073709551615n;
 
   const rows = events.map(e => ({
@@ -238,30 +177,23 @@ export async function insertOrderEvents(events: OrderEvent[]): Promise<number> {
     event_type: e.event_type,
     signature: e.signature,
     slot: e.slot,
-    block_time: Math.floor(e.block_time.getTime() / 1000), // Convert to Unix timestamp (seconds)
+    block_time: Math.floor(e.block_time.getTime() / 1000),
     maker: e.maker || null,
     give_token_address: e.give_token_address || null,
     give_token_symbol: e.give_token_symbol || null,
     give_amount: e.give_amount ? Number(e.give_amount) : null,
     give_amount_usd: e.give_amount_usd || null,
-    // Chain ID: Only include if it fits in UInt64, otherwise null
     give_chain_id: (e.give_chain_id && e.give_chain_id <= MAX_UINT64) ? Number(e.give_chain_id) : null,
     take_token_address: e.take_token_address || null,
     take_token_symbol: e.take_token_symbol || null,
     take_amount: e.take_amount ? Number(e.take_amount) : null,
     take_amount_usd: e.take_amount_usd || null,
-    // Chain ID: Only include if it fits in UInt64, otherwise null
     take_chain_id: (e.take_chain_id && e.take_chain_id <= MAX_UINT64) ? Number(e.take_chain_id) : null,
     receiver: e.receiver || null,
     taker: e.taker || null,
     fulfilled_amount: e.fulfilled_amount ? Number(e.fulfilled_amount) : null,
     fulfilled_amount_usd: e.fulfilled_amount_usd || null,
   }));
-
-  // Debug log first row if event_type is 'created'
-  if (events.length > 0 && events[0].event_type === 'created') {
-    logger.debug({ sample: rows[0], count: rows.length }, 'Inserting created events');
-  }
   
   await ch.insert({
     table: 'orders',
@@ -272,29 +204,17 @@ export async function insertOrderEvents(events: OrderEvent[]): Promise<number> {
     },
   });
   
-  // ReplacingMergeTree handles deduplication automatically
-  // Return the count of events we attempted to insert
   return events.length;
 }
 
 /**
  * Insert order events with explicit deduplication check
- * Use this when you need accurate count of new inserts
- * 
- * @returns Number of actually new events inserted
  */
 export async function insertOrderEventsDeduped(events: OrderEvent[]): Promise<number> {
   if (events.length === 0) return 0;
   
   const ch = getClickHouseClient();
   
-  // Get list of signatures to check
-  const signatureEventPairs = events.map(e => ({
-    signature: e.signature,
-    event_type: e.event_type,
-  }));
-  
-  // Check which already exist (batch query)
   const signatures = events.map(e => e.signature);
   const existingResult = await ch.query({
     query: `
@@ -311,33 +231,20 @@ export async function insertOrderEventsDeduped(events: OrderEvent[]): Promise<nu
     existingRows.map(r => `${r.signature}:${r.event_type}`)
   );
   
-  // Filter out duplicates
   const newEvents = events.filter(
     e => !existingSet.has(`${e.signature}:${e.event_type}`)
   );
   
   if (newEvents.length === 0) {
-    logger.debug({ 
-      total: events.length, 
-      duplicates: events.length 
-    }, 'All events were duplicates');
     return 0;
   }
   
-  // Insert only new events
   await insertOrderEvents(newEvents);
-  
-  logger.debug({
-    total: events.length,
-    new: newEvents.length,
-    duplicates: events.length - newEvents.length,
-  }, 'Inserted events (with dedup)');
-  
   return newEvents.length;
 }
 
 /**
- * Get collection progress
+ * Collection progress
  */
 export interface CollectionProgress {
   lastSignature: string | null;
@@ -372,9 +279,6 @@ export async function getCollectionProgress(
   };
 }
 
-/**
- * Update collection progress
- */
 export async function updateCollectionProgress(
   programId: string,
   eventType: 'created' | 'fulfilled',
@@ -390,15 +294,14 @@ export async function updateCollectionProgress(
       event_type: eventType,
       last_signature: lastSignature,
       total_collected: totalCollected,
-      updated_at: Math.floor(Date.now() / 1000), // Convert to Unix timestamp (seconds)
+      updated_at: Math.floor(Date.now() / 1000),
     }],
     format: 'JSONEachRow',
   });
 }
 
 /**
- * Get actual count of unique orders (after deduplication)
- * Uses FINAL keyword to get deduplicated count
+ * Get unique order count
  */
 export async function getUniqueOrderCount(
   eventType?: 'created' | 'fulfilled'
@@ -423,8 +326,12 @@ export async function getUniqueOrderCount(
   return parseInt(rows[0]?.cnt || '0', 10);
 }
 
+// =============================================================================
+// DASHBOARD QUERIES - JOIN fulfilled with created for USD values
+// =============================================================================
+
 /**
- * Query: Get daily volumes (uses FINAL for deduplication)
+ * Get daily volumes - JOIN fulfilled with created to get USD
  */
 export interface DailyVolume {
   date: string;
@@ -437,17 +344,49 @@ export interface DailyVolume {
 export async function getDailyVolumes(days: number = 30): Promise<DailyVolume[]> {
   const ch = getClickHouseClient();
   
+  // Query that joins fulfilled orders with their created orders to get USD values
   const result = await ch.query({
     query: `
+      WITH 
+        created_orders AS (
+          SELECT 
+            toDate(block_time) AS date,
+            order_id,
+            take_amount_usd
+          FROM orders FINAL
+          WHERE event_type = 'created'
+        ),
+        fulfilled_orders AS (
+          SELECT 
+            toDate(block_time) AS date,
+            order_id
+          FROM orders FINAL
+          WHERE event_type = 'fulfilled'
+        ),
+        -- Get USD for fulfilled by joining with created
+        fulfilled_with_usd AS (
+          SELECT 
+            f.date,
+            coalesce(c.take_amount_usd, 0) AS volume_usd
+          FROM fulfilled_orders f
+          LEFT JOIN created_orders c ON f.order_id = c.order_id
+        )
       SELECT
         date,
-        sumIf(order_count, event_type = 'created') AS created_count,
-        sumIf(volume_usd, event_type = 'created') AS created_volume_usd,
-        sumIf(order_count, event_type = 'fulfilled') AS fulfilled_count,
-        sumIf(volume_usd, event_type = 'fulfilled') AS fulfilled_volume_usd
-      FROM daily_volumes_mv
+        -- Created stats (direct from created_orders)
+        (SELECT count() FROM created_orders WHERE created_orders.date = dates.date) AS created_count,
+        (SELECT coalesce(sum(take_amount_usd), 0) FROM created_orders WHERE created_orders.date = dates.date) AS created_volume_usd,
+        -- Fulfilled stats (USD from joined data)
+        (SELECT count() FROM fulfilled_orders WHERE fulfilled_orders.date = dates.date) AS fulfilled_count,
+        (SELECT coalesce(sum(volume_usd), 0) FROM fulfilled_with_usd WHERE fulfilled_with_usd.date = dates.date) AS fulfilled_volume_usd
+      FROM (
+        SELECT DISTINCT date FROM (
+          SELECT date FROM created_orders
+          UNION ALL
+          SELECT date FROM fulfilled_orders
+        )
+      ) AS dates
       WHERE date >= today() - {days: UInt32}
-      GROUP BY date
       ORDER BY date ASC
     `,
     query_params: { days },
@@ -458,7 +397,7 @@ export async function getDailyVolumes(days: number = 30): Promise<DailyVolume[]>
 }
 
 /**
- * Query: Get total statistics (uses FINAL for accurate counts)
+ * Get total statistics - JOIN fulfilled with created for USD
  */
 export interface TotalStats {
   total_created: number;
@@ -472,12 +411,27 @@ export async function getTotalStats(): Promise<TotalStats> {
 
   const result = await ch.query({
     query: `
+      WITH 
+        created AS (
+          SELECT order_id, take_amount_usd
+          FROM orders FINAL
+          WHERE event_type = 'created'
+        ),
+        fulfilled AS (
+          SELECT order_id
+          FROM orders FINAL
+          WHERE event_type = 'fulfilled'
+        )
       SELECT
-        countIf(event_type = 'created') AS total_created,
-        countIf(event_type = 'fulfilled') AS total_fulfilled,
-        sumIf(take_amount_usd, event_type = 'created') AS total_created_volume_usd,
-        sumIf(fulfilled_amount_usd, event_type = 'fulfilled') AS total_fulfilled_volume_usd
-      FROM orders FINAL
+        (SELECT count() FROM created) AS total_created,
+        (SELECT count() FROM fulfilled) AS total_fulfilled,
+        (SELECT coalesce(sum(take_amount_usd), 0) FROM created) AS total_created_volume_usd,
+        -- Fulfilled USD = sum of take_amount_usd from matching created orders
+        (
+          SELECT coalesce(sum(c.take_amount_usd), 0)
+          FROM fulfilled f
+          LEFT JOIN created c ON f.order_id = c.order_id
+        ) AS total_fulfilled_volume_usd
     `,
     format: 'JSONEachRow',
   });
@@ -492,7 +446,7 @@ export async function getTotalStats(): Promise<TotalStats> {
 }
 
 /**
- * Query: Get top tokens by volume
+ * Get top tokens by volume (from created orders)
  */
 export interface TokenStat {
   symbol: string;
@@ -506,11 +460,13 @@ export async function getTopTokens(limit: number = 10): Promise<TokenStat[]> {
   const result = await ch.query({
     query: `
       SELECT
-        symbol,
-        sum(order_count) AS order_count,
-        sum(volume_usd) AS volume_usd
-      FROM token_stats_mv
-      WHERE symbol IS NOT NULL AND symbol != ''
+        give_token_symbol AS symbol,
+        count() AS order_count,
+        coalesce(sum(give_amount_usd), 0) AS volume_usd
+      FROM orders FINAL
+      WHERE event_type = 'created' 
+        AND give_token_symbol IS NOT NULL 
+        AND give_token_symbol != ''
       GROUP BY symbol
       ORDER BY volume_usd DESC
       LIMIT {limit: UInt32}
@@ -523,7 +479,7 @@ export async function getTopTokens(limit: number = 10): Promise<TokenStat[]> {
 }
 
 /**
- * Query: Get recent orders (uses FINAL for deduplication)
+ * Get recent orders with USD values
  */
 export interface RecentOrder {
   order_id: string;
@@ -541,21 +497,35 @@ export interface RecentOrder {
 export async function getRecentOrders(limit: number = 50): Promise<RecentOrder[]> {
   const ch = getClickHouseClient();
   
+  // For fulfilled orders, join with created to get token info
   const result = await ch.query({
     query: `
+      WITH created_data AS (
+        SELECT 
+          order_id,
+          give_token_symbol,
+          give_amount_usd,
+          take_token_symbol,
+          take_amount_usd,
+          maker
+        FROM orders FINAL
+        WHERE event_type = 'created'
+      )
       SELECT
-        order_id,
-        event_type,
-        signature,
-        block_time,
-        give_token_symbol,
-        give_amount_usd,
-        take_token_symbol,
-        take_amount_usd,
-        maker,
-        taker
-      FROM orders FINAL
-      ORDER BY block_time DESC
+        o.order_id,
+        o.event_type,
+        o.signature,
+        o.block_time,
+        -- For created: use own data, for fulfilled: join with created
+        if(o.event_type = 'created', o.give_token_symbol, c.give_token_symbol) AS give_token_symbol,
+        if(o.event_type = 'created', o.give_amount_usd, c.give_amount_usd) AS give_amount_usd,
+        if(o.event_type = 'created', o.take_token_symbol, c.take_token_symbol) AS take_token_symbol,
+        if(o.event_type = 'created', o.take_amount_usd, c.take_amount_usd) AS take_amount_usd,
+        if(o.event_type = 'created', o.maker, c.maker) AS maker,
+        o.taker
+      FROM orders FINAL AS o
+      LEFT JOIN created_data c ON o.order_id = c.order_id AND o.event_type = 'fulfilled'
+      ORDER BY o.block_time DESC
       LIMIT {limit: UInt32}
     `,
     query_params: { limit },
@@ -566,7 +536,7 @@ export async function getRecentOrders(limit: number = 50): Promise<RecentOrder[]
 }
 
 /**
- * Check if order already exists (for deduplication)
+ * Check if order event exists
  */
 export async function orderEventExists(
   signature: string, 
@@ -591,7 +561,6 @@ export async function orderEventExists(
 
 /**
  * Force optimization (merge) of the orders table
- * Call this periodically to consolidate duplicates
  */
 export async function optimizeOrdersTable(): Promise<void> {
   const ch = getClickHouseClient();

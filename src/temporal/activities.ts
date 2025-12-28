@@ -6,10 +6,13 @@
  * 2. DB Activities - Interact with ClickHouse (high throughput)
  * 
  * Each category runs on a separate task queue for optimal resource usage.
+ * 
+ * Now uses:
+ * - Multi-RPC connection pool with circuit breaker
+ * - Parallel transaction fetching
  */
 
 import { 
-  Connection, 
   PublicKey,
   ParsedTransactionWithMeta,
 } from '@solana/web3.js';
@@ -20,64 +23,27 @@ import {
   updateCollectionProgress,
   getUniqueOrderCount,
   initializeSchema,
-  getClickHouseClient,
   closeClickHouse,
   type OrderEvent,
 } from '../db/clickhouse.js';
 import { parseTransactions } from '../parser/transaction.js';
 import { logger } from '../utils/logger.js';
-
-// =============================================================================
-// Connection Pool Management
-// =============================================================================
-
-/**
- * Solana Connection Pool
- * Reuses connections across activity invocations to reduce overhead
- */
-class SolanaConnectionPool {
-  private static instance: SolanaConnectionPool;
-  private connection: Connection | null = null;
-  private lastUsed: number = 0;
-  private readonly maxIdleTime = 5 * 60 * 1000; // 5 minutes
-
-  static getInstance(): SolanaConnectionPool {
-    if (!SolanaConnectionPool.instance) {
-      SolanaConnectionPool.instance = new SolanaConnectionPool();
-    }
-    return SolanaConnectionPool.instance;
-  }
-
-  getConnection(): Connection {
-    const now = Date.now();
-    
-    // Create new connection if none exists or idle too long
-    if (!this.connection || (now - this.lastUsed) > this.maxIdleTime) {
-      const rpcUrl = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-      this.connection = new Connection(rpcUrl, {
-        commitment: 'confirmed',
-        confirmTransactionInitialTimeout: 60000,
-        disableRetryOnRateLimit: false,
-      });
-      logger.debug({ rpcUrl: rpcUrl.replace(/api[-_]?key=[\w-]+/gi, 'api-key=***') }, 'Created new Solana connection');
-    }
-    
-    this.lastUsed = now;
-    return this.connection;
-  }
-}
+import {
+  getRpcPool,
+  reportSuccess,
+  reportFailure,
+  fetchTransactionsWithHeartbeat,
+  type PoolStats,
+} from '../rpc/index.js';
 
 // =============================================================================
 // Error Classification
 // =============================================================================
 
-/**
- * Classifies errors for proper retry handling
- */
 export enum ErrorType {
-  RETRYABLE = 'RETRYABLE',           // Network issues, rate limits
-  NON_RETRYABLE = 'NON_RETRYABLE',   // Invalid input, not found
-  FATAL = 'FATAL',                    // Should stop workflow
+  RETRYABLE = 'RETRYABLE',
+  NON_RETRYABLE = 'NON_RETRYABLE',
+  FATAL = 'FATAL',
 }
 
 interface ClassifiedError {
@@ -133,7 +99,6 @@ function throwClassifiedError(error: unknown): never {
     throw ApplicationFailure.nonRetryable(classified.message, 'FatalError', classified.cause);
   }
   
-  // Retryable - just throw the original error
   throw classified.cause || new Error(classified.message);
 }
 
@@ -197,7 +162,6 @@ export interface StoreEventsOutput {
 export async function storeEvents(input: StoreEventsInput): Promise<StoreEventsOutput> {
   const info = activityInfo();
   
-  // Heartbeat for long batches
   Context.current().heartbeat({ phase: 'storing', eventCount: input.events.length });
   
   try {
@@ -213,7 +177,7 @@ export async function storeEvents(input: StoreEventsInput): Promise<StoreEventsO
       return { insertedCount: 0, duplicateCount: 0, totalCollected };
     }
     
-    // Deserialize events from Temporal (convert string to BigInt, ISO string to Date)
+    // Deserialize events from Temporal
     const deserializedEvents: OrderEvent[] = input.events.map((e: any) => ({
       ...e,
       give_amount: e.give_amount ? BigInt(e.give_amount) : undefined,
@@ -222,14 +186,11 @@ export async function storeEvents(input: StoreEventsInput): Promise<StoreEventsO
       block_time: new Date(e.block_time),
     }));
 
-    // Insert with deduplication
     const insertedCount = await insertOrderEventsDeduped(deserializedEvents);
     const duplicateCount = input.events.length - insertedCount;
     
-    // Get updated total
     const totalCollected = await getUniqueOrderCount(input.eventType);
     
-    // Update progress checkpoint
     await updateCollectionProgress(
       input.programId,
       input.eventType,
@@ -253,7 +214,7 @@ export async function storeEvents(input: StoreEventsInput): Promise<StoreEventsO
 }
 
 /**
- * Get current order counts (for final reporting)
+ * Get current order counts
  */
 export interface OrderCounts {
   created: number;
@@ -305,10 +266,8 @@ export async function fetchSignaturesBatch(
   input: FetchSignaturesInput
 ): Promise<FetchSignaturesOutput> {
   const info = activityInfo();
-  const pool = SolanaConnectionPool.getInstance();
-  const connection = pool.getConnection();
+  const pool = getRpcPool();
   
-  // Heartbeat
   Context.current().heartbeat({ 
     phase: 'fetching_signatures',
     programId: input.programId.slice(0, 8),
@@ -323,7 +282,9 @@ export async function fetchSignaturesBatch(
   }, 'Fetching signatures');
   
   try {
+    const { connection, endpoint } = pool.getConnection();
     const programPubkey = new PublicKey(input.programId);
+    const startTime = Date.now();
     
     const rawSignatures = await connection.getSignaturesForAddress(
       programPubkey,
@@ -333,6 +294,10 @@ export async function fetchSignaturesBatch(
       },
       'confirmed'
     );
+    
+    // Report success with latency
+    const latency = Date.now() - startTime;
+    reportSuccess(endpoint.name, latency);
     
     const signatures: SignatureInfo[] = rawSignatures.map(s => ({
       signature: s.signature,
@@ -349,8 +314,10 @@ export async function fetchSignaturesBatch(
     
     logger.info({ 
       activityId: info.activityId,
+      endpoint: endpoint.name,
       fetched: signatures.length,
       valid: validCount,
+      latencyMs: latency,
       hasMore: signatures.length === input.limit,
     }, 'Signatures fetched');
     
@@ -361,13 +328,17 @@ export async function fetchSignaturesBatch(
     };
     
   } catch (error) {
+    // Report failure - circuit breaker will handle it
+    const { endpoint } = pool.getConnection();
+    reportFailure(endpoint.name, error as Error);
+    
     logger.error({ error, programId: input.programId }, 'Failed to fetch signatures');
     throwClassifiedError(error);
   }
 }
 
 /**
- * Fetch and parse transactions
+ * Fetch and parse transactions using parallel fetcher
  */
 export interface ParseTransactionsInput {
   signatures: string[];
@@ -384,91 +355,58 @@ export async function fetchAndParseTransactions(
   input: ParseTransactionsInput
 ): Promise<ParseTransactionsOutput> {
   const info = activityInfo();
-  const pool = SolanaConnectionPool.getInstance();
-  const connection = pool.getConnection();
   
   if (input.signatures.length === 0) {
     return { events: [], processedCount: 0, errorCount: 0 };
   }
   
-  // Heartbeat with progress
-  Context.current().heartbeat({ 
-    phase: 'fetching_transactions',
-    count: input.signatures.length,
-  });
-  
   logger.debug({ 
     activityId: info.activityId,
     signatureCount: input.signatures.length,
     eventType: input.eventType,
-  }, 'Fetching transactions');
+  }, 'Fetching transactions with parallel fetcher');
   
   try {
-    // Fetch transactions (individually for free tier RPCs that don't support batch)
-    const useBatchRequests = process.env.RPC_BATCH_REQUESTS !== 'false';
-    let transactions;
-
-    if (useBatchRequests) {
-      // Use batch request (faster, requires paid RPC tier)
-      transactions = await connection.getParsedTransactions(
-        input.signatures,
-        {
-          maxSupportedTransactionVersion: 0,
-          commitment: 'confirmed',
-        }
-      );
-    } else {
-      // Fetch individually (slower, works with free tier RPCs)
-      transactions = [];
-      for (let i = 0; i < input.signatures.length; i++) {
-        const sig = input.signatures[i];
-        try {
-          const tx = await connection.getParsedTransaction(sig, {
-            maxSupportedTransactionVersion: 0,
-            commitment: 'confirmed',
-          });
-          transactions.push(tx);
-
-          // Heartbeat every 10 transactions
-          if ((i + 1) % 10 === 0) {
-            Context.current().heartbeat({
-              phase: 'fetching_transactions',
-              progress: `${i + 1}/${input.signatures.length}`,
-            });
+    // Use parallel fetcher with Temporal heartbeat
+    const transactions = await fetchTransactionsWithHeartbeat(
+      input.signatures,
+      (heartbeatInfo) => Context.current().heartbeat(heartbeatInfo),
+      {
+        concurrency: parseInt(process.env.FETCH_CONCURRENCY || '5'),
+        maxRetries: 3,
+        retryDelayMs: 1000,
+        useBatchApi: process.env.RPC_BATCH_REQUESTS !== 'false',
+        batchSize: parseInt(process.env.FETCH_BATCH_SIZE || '50'),
+        onProgress: (progress) => {
+          if (progress.completed % 100 === 0) {
+            logger.debug({
+              completed: progress.completed,
+              total: progress.total,
+              successful: progress.successful,
+              failed: progress.failed,
+            }, 'Fetch progress');
           }
-
-          // Small delay to avoid rate limiting
-          if (i < input.signatures.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-          }
-        } catch (err) {
-          logger.warn({ error: err, signature: sig }, 'Failed to fetch transaction');
-          transactions.push(null);
-        }
+        },
       }
-    }
+    );
 
-    // Heartbeat before parsing
     Context.current().heartbeat({ phase: 'parsing_transactions' });
     
-    // Count errors
     const errorCount = transactions.filter(t => t === null).length;
     const processedCount = transactions.length - errorCount;
     
     // Parse events
     const allEvents = await parseTransactions(transactions, input.signatures);
-
-    // Filter by event type
     const events = allEvents.filter(e => e.event_type === input.eventType);
 
-    // Serialize events for Temporal (convert BigInt to string, Date to ISO string)
+    // Serialize for Temporal
     const serializedEvents = events.map(e => ({
       ...e,
       give_amount: e.give_amount ? e.give_amount.toString() : undefined,
       take_amount: e.take_amount ? e.take_amount.toString() : undefined,
       fulfilled_amount: e.fulfilled_amount ? e.fulfilled_amount.toString() : undefined,
       block_time: e.block_time.toISOString(),
-    })) as any; // Type will be deserialized in storeOrderEvents
+    })) as any;
 
     logger.info({
       activityId: info.activityId,
@@ -487,11 +425,16 @@ export async function fetchAndParseTransactions(
 }
 
 /**
- * Health check for Solana RPC
+ * Health check for Solana RPC pool
  */
-export async function checkRpcHealth(): Promise<{ healthy: boolean; slot: number; latencyMs: number }> {
-  const pool = SolanaConnectionPool.getInstance();
-  const connection = pool.getConnection();
+export async function checkRpcHealth(): Promise<{ 
+  healthy: boolean; 
+  slot: number; 
+  latencyMs: number;
+  poolStats: PoolStats;
+}> {
+  const pool = getRpcPool();
+  const { connection, endpoint } = pool.getConnection();
   
   const start = Date.now();
   
@@ -499,19 +442,38 @@ export async function checkRpcHealth(): Promise<{ healthy: boolean; slot: number
     const slot = await connection.getSlot();
     const latencyMs = Date.now() - start;
     
-    return { healthy: true, slot, latencyMs };
+    reportSuccess(endpoint.name, latencyMs);
+    
+    return { 
+      healthy: true, 
+      slot, 
+      latencyMs,
+      poolStats: pool.getStats(),
+    };
   } catch (error) {
-    return { healthy: false, slot: 0, latencyMs: Date.now() - start };
+    reportFailure(endpoint.name, error as Error);
+    
+    return { 
+      healthy: false, 
+      slot: 0, 
+      latencyMs: Date.now() - start,
+      poolStats: pool.getStats(),
+    };
   }
+}
+
+/**
+ * Get RPC pool statistics
+ */
+export async function getRpcPoolStats(): Promise<PoolStats> {
+  const pool = getRpcPool();
+  return pool.getStats();
 }
 
 // =============================================================================
 // Activity Cleanup
 // =============================================================================
 
-/**
- * Cleanup resources (call on worker shutdown)
- */
 export async function cleanup(): Promise<void> {
   await closeClickHouse();
   logger.info('Activity resources cleaned up');

@@ -53,9 +53,10 @@ function getConfig(): ClientConfig {
     targetFulfilled: parseInt(process.env.TARGET_FULFILLED_ORDERS || '25000'),
     parallel: process.env.COLLECTION_PARALLEL !== 'false',
     config: {
+      // More aggressive defaults for faster collection
       signaturesBatchSize: parseInt(process.env.SIGNATURES_BATCH_SIZE || '1000'),
-      txBatchSize: parseInt(process.env.TX_BATCH_SIZE || '20'),
-      batchDelayMs: parseInt(process.env.BATCH_DELAY_MS || '500'),
+      txBatchSize: parseInt(process.env.TX_BATCH_SIZE || '100'),      // Increased from 20
+      batchDelayMs: parseInt(process.env.BATCH_DELAY_MS || '100'),    // Reduced from 500
     },
   };
 }
