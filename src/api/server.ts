@@ -15,6 +15,13 @@ import {
   getTopTokens,
   getRecentOrders,
   getCollectionProgress,
+  getChainBreakdown,
+  getStatsForPeriod,
+  getTopMakers,
+  getTopTakers,
+  getTokenPairs,
+  getOrderLifecycle,
+  getRecentFills,
 } from '../db/clickhouse.js';
 import { DLN_SOURCE_PROGRAM_ID, DLN_DESTINATION_PROGRAM_ID } from '../constants.js';
 import { logger } from '../utils/logger.js';
@@ -425,6 +432,126 @@ app.get('/metrics', asyncHandler(async (req: Request, res: Response) => {
   
   res.type('text/plain').send(lines.join('\n'));
 }));
+
+// =============================================================================
+// Advanced Analytics Endpoints
+// =============================================================================
+
+/**
+ * Chain breakdown - orders by source/destination chain
+ */
+app.get('/api/analytics/chains', asyncHandler(async (req: Request, res: Response) => {
+  const chains = await getChainBreakdown();
+  res.json({ success: true, data: chains });
+}));
+
+/**
+ * Time-filtered stats with fill rate and order size metrics
+ */
+app.get('/api/analytics/stats', asyncHandler(async (req: Request, res: Response) => {
+  const period = req.query.period as string || '24h';
+  
+  // Convert period to hours
+  const hoursMap: Record<string, number> = {
+    '1h': 1,
+    '24h': 24,
+    '7d': 24 * 7,
+    '30d': 24 * 30,
+    'all': 24 * 365 * 10, // ~10 years for "all"
+  };
+  
+  const hours = hoursMap[period] || 24;
+  const stats = await getStatsForPeriod(hours);
+  
+  res.json({
+    success: true,
+    data: {
+      period,
+      ...stats,
+    },
+  });
+}));
+
+/**
+ * Top makers leaderboard
+ */
+app.get('/api/analytics/top-makers', asyncHandler(async (req: Request, res: Response) => {
+  const limit = parseInt(req.query.limit as string) || 10;
+  const makers = await getTopMakers(Math.min(limit, 50));
+  
+  res.json({
+    success: true,
+    data: makers.map(m => ({
+      address: m.address,
+      orderCount: Number(m.order_count),
+      volumeUsd: Number(m.volume_usd),
+    })),
+  });
+}));
+
+/**
+ * Top takers leaderboard
+ */
+app.get('/api/analytics/top-takers', asyncHandler(async (req: Request, res: Response) => {
+  const limit = parseInt(req.query.limit as string) || 10;
+  const takers = await getTopTakers(Math.min(limit, 50));
+  
+  res.json({
+    success: true,
+    data: takers.map(t => ({
+      address: t.address,
+      orderCount: Number(t.order_count),
+      volumeUsd: Number(t.volume_usd),
+    })),
+  });
+}));
+
+/**
+ * Token pairs data for heatmap
+ */
+app.get('/api/analytics/token-pairs', asyncHandler(async (req: Request, res: Response) => {
+  const limit = parseInt(req.query.limit as string) || 20;
+  const pairs = await getTokenPairs(Math.min(limit, 50));
+  
+  res.json({
+    success: true,
+    data: pairs.map(p => ({
+      giveToken: p.give_token,
+      takeToken: p.take_token,
+      orderCount: Number(p.order_count),
+      volumeUsd: Number(p.volume_usd),
+    })),
+  });
+}));
+
+/**
+ * Order lifecycle - track single order from created to fulfilled
+ */
+app.get('/api/analytics/order/:orderId', asyncHandler(async (req: Request, res: Response) => {
+  const { orderId } = req.params;
+  const lifecycle = await getOrderLifecycle(orderId);
+  
+  if (!lifecycle) {
+    res.status(404).json({ success: false, error: 'Order not found' });
+    return;
+  }
+  
+  res.json({ success: true, data: lifecycle });
+}));
+
+/**
+ * Recent fills with fill times
+ */
+app.get('/api/analytics/recent-fills', asyncHandler(async (req: Request, res: Response) => {
+  const limit = parseInt(req.query.limit as string) || 20;
+  const fills = await getRecentFills(Math.min(limit, 50));
+  
+  res.json({ success: true, data: fills });
+}));
+
+// =============================================================================
+// Main Dashboard Endpoint
+// =============================================================================
 
 app.get('/api/dashboard', asyncHandler(async (req: Request, res: Response) => {
   const [stats, volumes, tokens, recentOrders, createdProgress, fulfilledProgress] = await Promise.all([

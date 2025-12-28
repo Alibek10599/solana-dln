@@ -525,3 +525,382 @@ export async function optimizeOrdersTable(): Promise<void> {
   });
   logger.info('Table optimization complete');
 }
+
+// =============================================================================
+// ADVANCED ANALYTICS
+// =============================================================================
+
+/**
+ * Chain breakdown - orders by source/destination chain
+ */
+export interface ChainStats {
+  chain_id: number;
+  chain_name: string;
+  order_count: number;
+  volume_usd: number;
+}
+
+export async function getChainBreakdown(): Promise<{ source: ChainStats[]; destination: ChainStats[] }> {
+  const ch = getClickHouseClient();
+  
+  const chainNames: Record<number, string> = {
+    1: 'Ethereum',
+    10: 'Optimism',
+    56: 'BSC',
+    100: 'Gnosis',
+    137: 'Polygon',
+    250: 'Fantom',
+    8453: 'Base',
+    42161: 'Arbitrum',
+    43114: 'Avalanche',
+    7565164: 'Solana',
+  };
+  
+  try {
+    const sourceResult = await ch.query({
+      query: `
+        SELECT
+          give_chain_id AS chain_id,
+          count() AS order_count,
+          coalesce(sum(give_amount_usd), 0) AS volume_usd
+        FROM orders FINAL
+        WHERE event_type = 'created' AND give_chain_id IS NOT NULL
+        GROUP BY chain_id
+        ORDER BY order_count DESC
+      `,
+      format: 'JSONEachRow',
+    });
+    
+    const destResult = await ch.query({
+      query: `
+        SELECT
+          take_chain_id AS chain_id,
+          count() AS order_count,
+          coalesce(sum(take_amount_usd), 0) AS volume_usd
+        FROM orders FINAL
+        WHERE event_type = 'created' AND take_chain_id IS NOT NULL
+        GROUP BY chain_id
+        ORDER BY order_count DESC
+      `,
+      format: 'JSONEachRow',
+    });
+    
+    const sourceData = await sourceResult.json<{ chain_id: number; order_count: number; volume_usd: number }>();
+    const destData = await destResult.json<{ chain_id: number; order_count: number; volume_usd: number }>();
+    
+    return {
+      source: sourceData.map(s => ({
+        ...s,
+        chain_id: Number(s.chain_id),
+        chain_name: chainNames[Number(s.chain_id)] || `Chain ${s.chain_id}`,
+        order_count: Number(s.order_count),
+        volume_usd: Number(s.volume_usd),
+      })),
+      destination: destData.map(d => ({
+        ...d,
+        chain_id: Number(d.chain_id),
+        chain_name: chainNames[Number(d.chain_id)] || `Chain ${d.chain_id}`,
+        order_count: Number(d.order_count),
+        volume_usd: Number(d.volume_usd),
+      })),
+    };
+  } catch (error) {
+    logger.error({ error }, 'Failed to get chain breakdown');
+    return { source: [], destination: [] };
+  }
+}
+
+/**
+ * Time-filtered stats
+ */
+export interface TimeFilteredStats {
+  total_created: number;
+  total_fulfilled: number;
+  total_volume_usd: number;
+  fill_rate: number;
+  avg_order_size: number;
+  median_order_size: number;
+}
+
+export async function getStatsForPeriod(hours: number): Promise<TimeFilteredStats> {
+  const ch = getClickHouseClient();
+  
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT
+          countIf(event_type = 'created') AS total_created,
+          countIf(event_type = 'fulfilled') AS total_fulfilled,
+          coalesce(sumIf(take_amount_usd, event_type = 'created'), 0) AS total_volume_usd,
+          coalesce(avgIf(take_amount_usd, event_type = 'created' AND take_amount_usd > 0), 0) AS avg_order_size,
+          coalesce(medianIf(take_amount_usd, event_type = 'created' AND take_amount_usd > 0), 0) AS median_order_size
+        FROM orders FINAL
+        WHERE block_time >= now() - toIntervalHour({hours: UInt32})
+      `,
+      query_params: { hours },
+      format: 'JSONEachRow',
+    });
+    
+    const rows = await result.json<{
+      total_created: number;
+      total_fulfilled: number;
+      total_volume_usd: number;
+      avg_order_size: number;
+      median_order_size: number;
+    }>();
+    
+    const row = rows[0] || {};
+    const created = Number(row.total_created) || 0;
+    const fulfilled = Number(row.total_fulfilled) || 0;
+    
+    return {
+      total_created: created,
+      total_fulfilled: fulfilled,
+      total_volume_usd: Number(row.total_volume_usd) || 0,
+      fill_rate: created > 0 ? (fulfilled / created) * 100 : 0,
+      avg_order_size: Number(row.avg_order_size) || 0,
+      median_order_size: Number(row.median_order_size) || 0,
+    };
+  } catch (error) {
+    logger.error({ error }, 'Failed to get stats for period');
+    return {
+      total_created: 0,
+      total_fulfilled: 0,
+      total_volume_usd: 0,
+      fill_rate: 0,
+      avg_order_size: 0,
+      median_order_size: 0,
+    };
+  }
+}
+
+/**
+ * Top makers/takers leaderboard
+ */
+export interface AddressStats {
+  address: string;
+  order_count: number;
+  volume_usd: number;
+}
+
+export async function getTopMakers(limit: number = 10): Promise<AddressStats[]> {
+  const ch = getClickHouseClient();
+  
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT
+          maker AS address,
+          count() AS order_count,
+          coalesce(sum(give_amount_usd), 0) AS volume_usd
+        FROM orders FINAL
+        WHERE event_type = 'created' AND maker IS NOT NULL AND maker != ''
+        GROUP BY maker
+        ORDER BY volume_usd DESC
+        LIMIT {limit: UInt32}
+      `,
+      query_params: { limit },
+      format: 'JSONEachRow',
+    });
+    
+    return result.json<AddressStats>();
+  } catch (error) {
+    logger.error({ error }, 'Failed to get top makers');
+    return [];
+  }
+}
+
+export async function getTopTakers(limit: number = 10): Promise<AddressStats[]> {
+  const ch = getClickHouseClient();
+  
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT
+          taker AS address,
+          count() AS order_count,
+          coalesce(sum(fulfilled_amount_usd), 0) AS volume_usd
+        FROM orders FINAL
+        WHERE event_type = 'fulfilled' AND taker IS NOT NULL AND taker != ''
+        GROUP BY taker
+        ORDER BY order_count DESC
+        LIMIT {limit: UInt32}
+      `,
+      query_params: { limit },
+      format: 'JSONEachRow',
+    });
+    
+    return result.json<AddressStats>();
+  } catch (error) {
+    logger.error({ error }, 'Failed to get top takers');
+    return [];
+  }
+}
+
+/**
+ * Token pair heatmap data
+ */
+export interface TokenPairStats {
+  give_token: string;
+  take_token: string;
+  order_count: number;
+  volume_usd: number;
+}
+
+export async function getTokenPairs(limit: number = 20): Promise<TokenPairStats[]> {
+  const ch = getClickHouseClient();
+  
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT
+          give_token_symbol AS give_token,
+          take_token_symbol AS take_token,
+          count() AS order_count,
+          coalesce(sum(give_amount_usd), 0) AS volume_usd
+        FROM orders FINAL
+        WHERE event_type = 'created' 
+          AND give_token_symbol IS NOT NULL AND give_token_symbol != ''
+          AND take_token_symbol IS NOT NULL AND take_token_symbol != ''
+        GROUP BY give_token, take_token
+        ORDER BY order_count DESC
+        LIMIT {limit: UInt32}
+      `,
+      query_params: { limit },
+      format: 'JSONEachRow',
+    });
+    
+    return result.json<TokenPairStats>();
+  } catch (error) {
+    logger.error({ error }, 'Failed to get token pairs');
+    return [];
+  }
+}
+
+/**
+ * Order lifecycle - find matching created/fulfilled orders
+ */
+export interface OrderLifecycle {
+  order_id: string;
+  created_at: string | null;
+  created_signature: string | null;
+  fulfilled_at: string | null;
+  fulfilled_signature: string | null;
+  maker: string | null;
+  taker: string | null;
+  give_token: string | null;
+  take_token: string | null;
+  amount_usd: number | null;
+  time_to_fill_seconds: number | null;
+}
+
+export async function getOrderLifecycle(orderId: string): Promise<OrderLifecycle | null> {
+  const ch = getClickHouseClient();
+  
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT
+          order_id,
+          minIf(block_time, event_type = 'created') AS created_at,
+          argMinIf(signature, block_time, event_type = 'created') AS created_signature,
+          minIf(block_time, event_type = 'fulfilled') AS fulfilled_at,
+          argMinIf(signature, block_time, event_type = 'fulfilled') AS fulfilled_signature,
+          anyIf(maker, event_type = 'created') AS maker,
+          anyIf(taker, event_type = 'fulfilled') AS taker,
+          anyIf(give_token_symbol, event_type = 'created') AS give_token,
+          anyIf(take_token_symbol, event_type = 'created') AS take_token,
+          anyIf(take_amount_usd, event_type = 'created') AS amount_usd
+        FROM orders FINAL
+        WHERE order_id = {orderId: String}
+        GROUP BY order_id
+      `,
+      query_params: { orderId },
+      format: 'JSONEachRow',
+    });
+    
+    const rows = await result.json<any>();
+    if (rows.length === 0) return null;
+    
+    const row = rows[0];
+    const createdAt = row.created_at ? new Date(row.created_at) : null;
+    const fulfilledAt = row.fulfilled_at ? new Date(row.fulfilled_at) : null;
+    
+    return {
+      order_id: row.order_id,
+      created_at: row.created_at,
+      created_signature: row.created_signature,
+      fulfilled_at: row.fulfilled_at,
+      fulfilled_signature: row.fulfilled_signature,
+      maker: row.maker,
+      taker: row.taker,
+      give_token: row.give_token,
+      take_token: row.take_token,
+      amount_usd: Number(row.amount_usd) || null,
+      time_to_fill_seconds: createdAt && fulfilledAt 
+        ? Math.floor((fulfilledAt.getTime() - createdAt.getTime()) / 1000)
+        : null,
+    };
+  } catch (error) {
+    logger.error({ error }, 'Failed to get order lifecycle');
+    return null;
+  }
+}
+
+/**
+ * Recent fulfilled orders with fill times
+ */
+export async function getRecentFills(limit: number = 20): Promise<OrderLifecycle[]> {
+  const ch = getClickHouseClient();
+  
+  try {
+    const result = await ch.query({
+      query: `
+        SELECT
+          order_id,
+          minIf(block_time, event_type = 'created') AS created_at,
+          argMinIf(signature, block_time, event_type = 'created') AS created_signature,
+          minIf(block_time, event_type = 'fulfilled') AS fulfilled_at,
+          argMinIf(signature, block_time, event_type = 'fulfilled') AS fulfilled_signature,
+          anyIf(maker, event_type = 'created') AS maker,
+          anyIf(taker, event_type = 'fulfilled') AS taker,
+          anyIf(give_token_symbol, event_type = 'created') AS give_token,
+          anyIf(take_token_symbol, event_type = 'created') AS take_token,
+          anyIf(take_amount_usd, event_type = 'created') AS amount_usd
+        FROM orders FINAL
+        GROUP BY order_id
+        HAVING fulfilled_at IS NOT NULL AND fulfilled_at != '1970-01-01 00:00:00'
+        ORDER BY fulfilled_at DESC
+        LIMIT {limit: UInt32}
+      `,
+      query_params: { limit },
+      format: 'JSONEachRow',
+    });
+    
+    const rows = await result.json<any>();
+    
+    return rows.map((row: any) => {
+      const createdAt = row.created_at ? new Date(row.created_at) : null;
+      const fulfilledAt = row.fulfilled_at ? new Date(row.fulfilled_at) : null;
+      
+      return {
+        order_id: row.order_id,
+        created_at: row.created_at,
+        created_signature: row.created_signature,
+        fulfilled_at: row.fulfilled_at,
+        fulfilled_signature: row.fulfilled_signature,
+        maker: row.maker,
+        taker: row.taker,
+        give_token: row.give_token,
+        take_token: row.take_token,
+        amount_usd: Number(row.amount_usd) || null,
+        time_to_fill_seconds: createdAt && fulfilledAt 
+          ? Math.floor((fulfilledAt.getTime() - createdAt.getTime()) / 1000)
+          : null,
+      };
+    });
+  } catch (error) {
+    logger.error({ error }, 'Failed to get recent fills');
+    return [];
+  }
+}
