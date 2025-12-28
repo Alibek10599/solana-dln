@@ -19,7 +19,7 @@ import {
 import { DLN_SOURCE_PROGRAM_ID, DLN_DESTINATION_PROGRAM_ID } from '../constants.js';
 import { logger } from '../utils/logger.js';
 import { getRpcPool } from '../rpc/index.js';
-import { getParseStats } from '../parser/transaction.js';
+import { getParseStats, getUnknownTokens } from '../parser/transaction.js';
 
 const app = express();
 const PORT = parseInt(process.env.API_PORT || '3001');
@@ -296,7 +296,7 @@ app.get('/api/metrics', asyncHandler(async (req: Request, res: Response) => {
 }));
 
 /**
- * Debug endpoint - check USD calculation data
+ * Debug endpoint - check USD calculation data and unknown tokens
  */
 app.get('/api/debug/usd', asyncHandler(async (req: Request, res: Response) => {
   const ch = getClickHouseClient();
@@ -340,6 +340,13 @@ app.get('/api/debug/usd', asyncHandler(async (req: Request, res: Response) => {
     `,
     format: 'JSONEachRow',
   });
+
+  // Get unknown tokens from parser
+  const unknownTokens = getUnknownTokens();
+  const unknownTokensList = Array.from(unknownTokens.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 20)
+    .map(([address, count]) => ({ address, count }));
   
   res.json({
     success: true,
@@ -347,6 +354,7 @@ app.get('/api/debug/usd', asyncHandler(async (req: Request, res: Response) => {
       tokenAddresses: tokens,
       sampleWithUsd: await sampleWithUsd.json(),
       sampleWithoutUsd: await sampleWithoutUsd.json(),
+      unknownTokens: unknownTokensList,
     },
   });
 }));
