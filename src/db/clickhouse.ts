@@ -353,13 +353,14 @@ export async function getDailyVolumes(days: number = 30): Promise<DailyVolume[]>
   const ch = getClickHouseClient();
   
   try {
-    // Simple query - get counts and volumes per day per event type
+    // For created orders: use give_amount_usd (what maker is giving)
+    // For fulfilled orders: use take_amount_usd (what taker is giving)
     const result = await ch.query({
       query: `
         SELECT
           toDate(block_time) AS date,
           countIf(event_type = 'created') AS created_count,
-          coalesce(sumIf(take_amount_usd, event_type = 'created'), 0) AS created_volume_usd,
+          coalesce(sumIf(give_amount_usd, event_type = 'created'), 0) AS created_volume_usd,
           countIf(event_type = 'fulfilled') AS fulfilled_count,
           coalesce(sumIf(take_amount_usd, event_type = 'fulfilled'), 0) AS fulfilled_volume_usd
         FROM orders FINAL
@@ -389,12 +390,14 @@ export async function getTotalStats(): Promise<TotalStats> {
   const ch = getClickHouseClient();
 
   try {
+    // For created orders: use give_amount_usd (what maker is giving)
+    // For fulfilled orders: use take_amount_usd (what taker is giving)
     const result = await ch.query({
       query: `
         SELECT
           countIf(event_type = 'created') AS total_created,
           countIf(event_type = 'fulfilled') AS total_fulfilled,
-          coalesce(sumIf(take_amount_usd, event_type = 'created'), 0) AS total_created_volume_usd,
+          coalesce(sumIf(give_amount_usd, event_type = 'created'), 0) AS total_created_volume_usd,
           coalesce(sumIf(take_amount_usd, event_type = 'fulfilled'), 0) AS total_fulfilled_volume_usd
         FROM orders FINAL
       `,
@@ -641,9 +644,9 @@ export async function getStatsForPeriod(hours: number): Promise<TimeFilteredStat
         SELECT
           countIf(event_type = 'created') AS total_created,
           countIf(event_type = 'fulfilled') AS total_fulfilled,
-          coalesce(sumIf(take_amount_usd, event_type = 'created'), 0) AS total_volume_usd,
-          coalesce(avgIf(take_amount_usd, event_type = 'created' AND take_amount_usd > 0), 0) AS avg_order_size,
-          coalesce(medianIf(take_amount_usd, event_type = 'created' AND take_amount_usd > 0), 0) AS median_order_size
+          coalesce(sumIf(give_amount_usd, event_type = 'created'), 0) AS total_volume_usd,
+          coalesce(avgIf(give_amount_usd, event_type = 'created' AND give_amount_usd > 0), 0) AS avg_order_size,
+          coalesce(medianIf(give_amount_usd, event_type = 'created' AND give_amount_usd > 0), 0) AS median_order_size
         FROM orders FINAL
         WHERE block_time >= now() - toIntervalHour({hours: UInt32})
       `,
@@ -820,7 +823,7 @@ export async function getOrderLifecycle(orderId: string): Promise<OrderLifecycle
           anyIf(taker, event_type = 'fulfilled') AS taker,
           anyIf(give_token_symbol, event_type = 'created') AS give_token,
           anyIf(take_token_symbol, event_type = 'created') AS take_token,
-          anyIf(take_amount_usd, event_type = 'created') AS amount_usd
+          anyIf(give_amount_usd, event_type = 'created') AS amount_usd
         FROM orders FINAL
         WHERE order_id = {orderId: String}
         GROUP BY order_id
@@ -876,7 +879,7 @@ export async function getRecentFills(limit: number = 20): Promise<OrderLifecycle
           anyIf(taker, event_type = 'fulfilled') AS taker,
           anyIf(give_token_symbol, event_type = 'created') AS give_token,
           anyIf(take_token_symbol, event_type = 'created') AS take_token,
-          anyIf(take_amount_usd, event_type = 'created') AS amount_usd
+          anyIf(give_amount_usd, event_type = 'created') AS amount_usd
         FROM orders FINAL
         GROUP BY order_id
         HAVING fulfilled_at IS NOT NULL AND fulfilled_at != '1970-01-01 00:00:00'

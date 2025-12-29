@@ -32,3 +32,6 @@ logs/
 
 # TypeScript
 *.tsbuildinfo
+
+package-lock.json
+dashboard/package-lock.json
