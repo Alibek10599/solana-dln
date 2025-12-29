@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { 
-  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
+import {
+  Tooltip, ResponsiveContainer, Cell,
   PieChart, Pie, Legend
 } from 'recharts';
 import { Globe, TrendingUp, Users, ArrowRightLeft, Clock, ExternalLink } from 'lucide-react';

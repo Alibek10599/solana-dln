@@ -159,9 +159,19 @@ export interface OrderEvent {
  */
 export async function insertOrderEvents(events: OrderEvent[]): Promise<number> {
   if (events.length === 0) return 0;
-  
+
   const ch = getClickHouseClient();
   const MAX_UINT64 = 18446744073709551615n;
+
+  // Debug: Log first event to see what we're inserting
+  if (events.length > 0 && events[0].event_type === 'created') {
+    console.log('[DB INSERT DEBUG] First created event:', {
+      order_id: events[0].order_id,
+      give_amount: events[0].give_amount?.toString(),
+      give_amount_type: typeof events[0].give_amount,
+      give_amount_truthy: !!events[0].give_amount,
+    });
+  }
 
   const rows = events.map(e => ({
     order_id: e.order_id,

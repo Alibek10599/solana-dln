@@ -369,9 +369,10 @@ export interface CreateOrderInstruction {
 }
 
 export function parseCreateOrderInstruction(data: Buffer): CreateOrderInstruction | null {
+  console.log('[BORSH PARSER] parseCreateOrderInstruction called with data length:', data.length);
   try {
     const reader = new BorshDeserializer(data);
-    
+
     // Skip 8-byte discriminator
     reader.skip(8);
     
@@ -394,7 +395,12 @@ export function parseCreateOrderInstruction(data: Buffer): CreateOrderInstructio
       referralCode,
     };
   } catch (error) {
-    console.error('Failed to parse create_order instruction:', error);
+    // Log to stderr which goes to docker logs
+    console.error('[BORSH PARSER ERROR] Failed to parse create_order instruction:', {
+      error: error instanceof Error ? error.message : String(error),
+      dataLength: data.length,
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     return null;
   }
 }

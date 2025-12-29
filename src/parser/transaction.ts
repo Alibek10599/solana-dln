@@ -1,28 +1,20 @@
 /**
  * Transaction Parser for DLN Solana Events
  * 
- * Parses Solana transactions to extract DLN order events using
- * low-level Borsh deserialization combined with log analysis.
+ * Extracts amounts from token balance changes instead of
+ * parsing instruction data - this is more reliable.
  */
 
 import { 
   ParsedTransactionWithMeta, 
-  PartiallyDecodedInstruction,
-  ParsedInstruction,
-  PublicKey,
+  TokenBalance,
 } from '@solana/web3.js';
-import bs58 from 'bs58';
 import { 
   DLN_SOURCE_PROGRAM_ID, 
   DLN_DESTINATION_PROGRAM_ID,
   KNOWN_TOKENS,
   EVM_TOKENS,
-  getTokenInfo,
-  SOLANA_CHAIN_ID,
 } from '../constants.js';
-import { 
-  BorshDeserializer,
-} from './borsh.js';
 import type { OrderEvent } from '../db/clickhouse.js';
 import { logger } from '../utils/logger.js';
 
@@ -46,88 +38,70 @@ export async function parseTransaction(
   const slot = tx.slot;
   const logs = tx.meta.logMessages || [];
   
+  // Check if this transaction involves DLN programs
   const instructions = tx.transaction.message.instructions;
   const innerInstructions = tx.meta.innerInstructions || [];
   
-  for (let i = 0; i < instructions.length; i++) {
-    const ix = instructions[i];
+  let isDlnSource = false;
+  let isDlnDestination = false;
+  
+  const dlnSourceId = DLN_SOURCE_PROGRAM_ID.toBase58();
+  const dlnDestId = DLN_DESTINATION_PROGRAM_ID.toBase58();
+  
+  // Check all instructions for DLN program involvement
+  for (const ix of instructions) {
     const programId = ix.programId.toBase58();
-    
-    if (programId === DLN_SOURCE_PROGRAM_ID.toBase58()) {
-      const event = await parseSourceInstruction(ix, signature, slot, blockTime, logs);
-      if (event) events.push(event);
-    } else if (programId === DLN_DESTINATION_PROGRAM_ID.toBase58()) {
-      const event = await parseDestinationInstruction(ix, signature, slot, blockTime, logs);
-      if (event) events.push(event);
+    if (programId === dlnSourceId) isDlnSource = true;
+    if (programId === dlnDestId) isDlnDestination = true;
+  }
+  
+  // Also check inner instructions
+  for (const inner of innerInstructions) {
+    for (const ix of inner.instructions) {
+      const programId = ix.programId.toBase58();
+      if (programId === dlnSourceId) isDlnSource = true;
+      if (programId === dlnDestId) isDlnDestination = true;
     }
-    
-    const inner = innerInstructions.find(ii => ii.index === i);
-    if (inner) {
-      for (const innerIx of inner.instructions) {
-        const innerProgramId = innerIx.programId.toBase58();
-        
-        if (innerProgramId === DLN_SOURCE_PROGRAM_ID.toBase58()) {
-          const event = await parseSourceInstruction(innerIx, signature, slot, blockTime, logs);
-          if (event) events.push(event);
-        } else if (innerProgramId === DLN_DESTINATION_PROGRAM_ID.toBase58()) {
-          const event = await parseDestinationInstruction(innerIx, signature, slot, blockTime, logs);
-          if (event) events.push(event);
-        }
-      }
-    }
+  }
+  
+  // Extract order ID from logs
+  const orderId = extractOrderIdFromLogs(logs);
+  
+  if (isDlnSource && orderId) {
+    const event = parseOrderCreation(tx, signature, slot, blockTime, orderId);
+    if (event) events.push(event);
+  }
+  
+  if (isDlnDestination && orderId) {
+    const event = parseOrderFulfillment(tx, signature, slot, blockTime, orderId);
+    if (event) events.push(event);
   }
   
   return events;
 }
 
 /**
- * Parse DLN Source instruction (order creation)
+ * Parse order creation from transaction
+ * Extracts amounts from token balance changes
  */
-async function parseSourceInstruction(
-  ix: ParsedInstruction | PartiallyDecodedInstruction,
+function parseOrderCreation(
+  tx: ParsedTransactionWithMeta,
   signature: string,
   slot: number,
   blockTime: Date,
-  logs: string[]
-): Promise<OrderEvent | null> {
-  try {
-    if (!('data' in ix)) {
-      return null;
-    }
-    
-    const data = Buffer.from(bs58.decode(ix.data));
-    
-    if (data.length < 8) {
-      return null;
-    }
-    
-    const orderId = extractOrderIdFromLogs(logs, DLN_SOURCE_PROGRAM_ID.toBase58());
-    if (!orderId) {
-      logger.debug({ signature }, 'Could not extract orderId from logs');
-      return null;
-    }
-    
-    const orderData = parseCreateOrderData(data);
-    if (!orderData) {
-      return null;
-    }
-    
-    const accounts = 'accounts' in ix ? ix.accounts.map(a => a.toBase58()) : [];
-    const maker = accounts[0] || null;
-    
-    // Resolve token symbols and calculate USD
-    const giveTokenInfo = resolveToken(orderData.giveTokenAddress);
-    const takeTokenInfo = resolveToken(orderData.takeTokenAddress);
-    
-    const giveAmountUsd = calculateUsdValue(
-      orderData.giveAmount,
-      giveTokenInfo
-    );
-    const takeAmountUsd = calculateUsdValue(
-      orderData.takeAmount,
-      takeTokenInfo
-    );
-    
+  orderId: string
+): OrderEvent | null {
+  const meta = tx.meta!;
+  
+  // Get the maker (first signer)
+  const accounts = tx.transaction.message.accountKeys;
+  const maker = accounts.find(a => a.signer)?.pubkey.toBase58() || null;
+  
+  // Extract token transfer info from balance changes
+  const tokenTransfer = extractTokenTransfer(meta);
+  
+  if (!tokenTransfer) {
+    // Fallback: return basic info without token transfer data
     return {
       order_id: orderId,
       event_type: 'created',
@@ -135,90 +109,165 @@ async function parseSourceInstruction(
       slot,
       block_time: blockTime,
       maker: maker || undefined,
-      give_token_address: orderData.giveTokenAddress,
-      give_token_symbol: giveTokenInfo?.symbol,
-      give_amount: orderData.giveAmount,
-      give_amount_usd: giveAmountUsd,
-      give_chain_id: Number(orderData.giveChainId),
-      take_token_address: orderData.takeTokenAddress,
-      take_token_symbol: takeTokenInfo?.symbol,
-      take_amount: orderData.takeAmount,
-      take_amount_usd: takeAmountUsd,
-      take_chain_id: Number(orderData.takeChainId),
-      receiver: orderData.receiver,
     };
-  } catch (error) {
-    logger.debug({ error, signature }, 'Failed to parse source instruction');
-    return null;
   }
+  
+  // Resolve token info
+  const tokenInfo = resolveToken(tokenTransfer.mint);
+  const symbol = tokenInfo?.symbol;
+  const decimals = tokenInfo?.decimals || 6;
+  const price = tokenInfo?.estimatedPrice || (symbol === 'USDC' || symbol === 'USDT' ? 1 : undefined);
+  
+  // Calculate USD value
+  const rawAmount = tokenTransfer.amount / Math.pow(10, decimals);
+  const amountUsd = price ? rawAmount * price : undefined;
+  
+  logger.info({
+    signature: signature.slice(0, 16),
+    orderId: orderId.slice(0, 16),
+    mint: tokenTransfer.mint.slice(0, 12),
+    symbol,
+    rawAmount: rawAmount.toFixed(2),
+    amountUsd: amountUsd?.toFixed(2),
+  }, 'Parsed order creation');
+  
+  return {
+    order_id: orderId,
+    event_type: 'created',
+    signature,
+    slot,
+    block_time: blockTime,
+    maker: maker || undefined,
+    give_token_address: tokenTransfer.mint,
+    give_token_symbol: symbol,
+    give_amount: BigInt(Math.floor(tokenTransfer.amount)),
+    give_amount_usd: amountUsd,
+    give_chain_id: 7565164, // Solana chain ID
+  };
 }
 
 /**
- * Parse DLN Destination instruction (order fulfillment)
+ * Parse order fulfillment from transaction
  */
-async function parseDestinationInstruction(
-  ix: ParsedInstruction | PartiallyDecodedInstruction,
+function parseOrderFulfillment(
+  tx: ParsedTransactionWithMeta,
   signature: string,
   slot: number,
   blockTime: Date,
-  logs: string[]
-): Promise<OrderEvent | null> {
-  try {
-    if (!('data' in ix)) {
-      return null;
+  orderId: string
+): OrderEvent | null {
+  const meta = tx.meta!;
+  
+  // Get the taker (first signer)
+  const accounts = tx.transaction.message.accountKeys;
+  const taker = accounts.find(a => a.signer)?.pubkey.toBase58() || null;
+  
+  // Extract token transfer info
+  const tokenTransfer = extractTokenTransfer(meta);
+  
+  let symbol: string | undefined;
+  let amountUsd: number | undefined;
+  let amount: bigint | undefined;
+  
+  if (tokenTransfer) {
+    const tokenInfo = resolveToken(tokenTransfer.mint);
+    symbol = tokenInfo?.symbol;
+    const decimals = tokenInfo?.decimals || 6;
+    const price = tokenInfo?.estimatedPrice || (symbol === 'USDC' || symbol === 'USDT' ? 1 : undefined);
+    
+    const rawAmount = tokenTransfer.amount / Math.pow(10, decimals);
+    amountUsd = price ? rawAmount * price : undefined;
+    amount = BigInt(Math.floor(tokenTransfer.amount));
+  }
+  
+  return {
+    order_id: orderId,
+    event_type: 'fulfilled',
+    signature,
+    slot,
+    block_time: blockTime,
+    taker: taker || undefined,
+    take_token_symbol: symbol,
+    take_amount: amount,
+    take_amount_usd: amountUsd,
+    take_chain_id: 7565164, // Solana chain ID
+  };
+}
+
+/**
+ * Extract token transfer amount from balance changes
+ */
+function extractTokenTransfer(meta: ParsedTransactionWithMeta['meta']): {
+  mint: string;
+  amount: number;
+  owner: string;
+} | null {
+  if (!meta) return null;
+  
+  const preBalances = meta.preTokenBalances || [];
+  const postBalances = meta.postTokenBalances || [];
+  
+  // Find the largest balance change
+  let maxChange = 0;
+  let result: { mint: string; amount: number; owner: string } | null = null;
+  
+  // Create a map of pre-balances
+  const preBalanceMap = new Map<string, TokenBalance>();
+  for (const bal of preBalances) {
+    const key = `${bal.accountIndex}-${bal.mint}`;
+    preBalanceMap.set(key, bal);
+  }
+  
+  // Compare with post-balances to find changes
+  for (const postBal of postBalances) {
+    const key = `${postBal.accountIndex}-${postBal.mint}`;
+    const preBal = preBalanceMap.get(key);
+    
+    const preAmount = Number(preBal?.uiTokenAmount?.amount || '0');
+    const postAmount = Number(postBal.uiTokenAmount?.amount || '0');
+    const change = Math.abs(postAmount - preAmount);
+    
+    if (change > maxChange && change > 0) {
+      maxChange = change;
+      result = {
+        mint: postBal.mint,
+        amount: change,
+        owner: postBal.owner || '',
+      };
     }
-    
-    const data = Buffer.from(bs58.decode(ix.data));
-    
-    if (data.length < 8) {
-      return null;
-    }
-    
-    let orderId = extractOrderIdFromLogs(logs, DLN_DESTINATION_PROGRAM_ID.toBase58());
-    if (!orderId) {
-      orderId = parseFulfillOrderData(data);
-      if (!orderId) {
-        logger.debug({ signature }, 'Could not extract orderId for fulfill');
-        return null;
+  }
+  
+  // Check for new token accounts (where preBal doesn't exist)
+  for (const postBal of postBalances) {
+    const key = `${postBal.accountIndex}-${postBal.mint}`;
+    if (!preBalanceMap.has(key)) {
+      const amount = Number(postBal.uiTokenAmount?.amount || '0');
+      if (amount > maxChange) {
+        maxChange = amount;
+        result = {
+          mint: postBal.mint,
+          amount,
+          owner: postBal.owner || '',
+        };
       }
     }
-    
-    const accounts = 'accounts' in ix ? ix.accounts.map(a => a.toBase58()) : [];
-    const taker = accounts[0] || null;
-    
-    return {
-      order_id: orderId,
-      event_type: 'fulfilled',
-      signature,
-      slot,
-      block_time: blockTime,
-      taker: taker || undefined,
-    };
-  } catch (error) {
-    logger.debug({ error, signature }, 'Failed to parse destination instruction');
-    return null;
   }
+  
+  return result;
 }
 
 /**
  * Extract orderId from transaction logs
  */
-function extractOrderIdFromLogs(logs: string[], programId: string): string | null {
-  let inTargetProgram = false;
-  
+function extractOrderIdFromLogs(logs: string[]): string | null {
   for (const log of logs) {
-    if (log.includes(`Program ${programId} invoke`)) {
-      inTargetProgram = true;
-    } else if (log.includes('Program log:') && inTargetProgram) {
-      const match = log.match(/order[_\s]?id[:\s]+([a-fA-F0-9]{64})/i);
-      if (match) {
-        return match[1].toLowerCase();
-      }
-    } else if (log.startsWith('Program data:') && inTargetProgram) {
+    // Look for Program data logs (Anchor events)
+    if (log.startsWith('Program data:')) {
       try {
         const base64Data = log.replace('Program data:', '').trim();
         const eventData = Buffer.from(base64Data, 'base64');
         
+        // Anchor events have 8-byte discriminator + data
         if (eventData.length >= 40) {
           const orderId = eventData.slice(8, 40).toString('hex');
           if (orderId !== '0'.repeat(64)) {
@@ -228,85 +277,15 @@ function extractOrderIdFromLogs(logs: string[], programId: string): string | nul
       } catch {
         continue;
       }
-    } else if (log.includes(`Program ${programId} success`) || 
-               log.includes(`Program ${programId} failed`)) {
-      inTargetProgram = false;
+    }
+    
+    // Also check for direct log matches
+    const match = log.match(/order[_\s]?id[:\s]+([a-fA-F0-9]{64})/i);
+    if (match) {
+      return match[1].toLowerCase();
     }
   }
-  
   return null;
-}
-
-interface CreateOrderData {
-  giveTokenAddress: string;
-  giveAmount: bigint;
-  giveChainId: bigint;
-  takeTokenAddress: string;
-  takeAmount: bigint;
-  takeChainId: bigint;
-  receiver: string;
-}
-
-function parseCreateOrderData(data: Buffer): CreateOrderData | null {
-  try {
-    const reader = new BorshDeserializer(data);
-    
-    reader.skip(8); // discriminator
-    reader.readU64(); // maker nonce
-    reader.skip(32); // maker address
-    
-    const giveTokenBytes = reader.readBytes(32);
-    const giveTokenAddress = tryParseAddress(giveTokenBytes);
-    const giveAmount = reader.readU64();
-    const giveChainId = reader.readU256();
-    
-    const takeTokenBytes = reader.readBytes(32);
-    const takeTokenAddress = tryParseAddress(takeTokenBytes);
-    const takeAmount = reader.readU64();
-    const takeChainId = reader.readU256();
-    
-    const receiverBytes = reader.readBytes(32);
-    const receiver = tryParseAddress(receiverBytes);
-    
-    return {
-      giveTokenAddress,
-      giveAmount,
-      giveChainId,
-      takeTokenAddress,
-      takeAmount,
-      takeChainId,
-      receiver,
-    };
-  } catch (error) {
-    logger.debug({ error }, 'Failed to parse create order data');
-    return null;
-  }
-}
-
-function parseFulfillOrderData(data: Buffer): string | null {
-  try {
-    const reader = new BorshDeserializer(data);
-    reader.skip(8);
-    const orderId = reader.readBytes(32).toString('hex');
-    if (orderId !== '0'.repeat(64)) {
-      return orderId;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Try to parse address bytes as Solana base58 or EVM hex
- */
-function tryParseAddress(bytes: Buffer): string {
-  try {
-    const pubkey = new PublicKey(bytes);
-    return pubkey.toBase58();
-  } catch {
-    return '0x' + bytes.toString('hex');
-  }
 }
 
 interface TokenInfo {
@@ -316,55 +295,26 @@ interface TokenInfo {
 }
 
 /**
- * Resolve token info from address (Solana or EVM)
+ * Resolve token info from mint address
  */
-function resolveToken(address: string): TokenInfo | undefined {
-  // Check Solana tokens
-  if (KNOWN_TOKENS[address]) {
-    return KNOWN_TOKENS[address];
+function resolveToken(mint: string): TokenInfo | undefined {
+  if (KNOWN_TOKENS[mint]) {
+    return KNOWN_TOKENS[mint];
   }
   
-  // Check EVM tokens (normalize to lowercase)
-  const normalizedAddress = address.toLowerCase();
-  if (EVM_TOKENS[normalizedAddress]) {
-    return EVM_TOKENS[normalizedAddress];
+  const normalizedMint = mint.toLowerCase();
+  if (EVM_TOKENS[normalizedMint]) {
+    return EVM_TOKENS[normalizedMint];
   }
   
-  // Track unknown tokens for debugging
-  const count = unknownTokens.get(address) || 0;
-  unknownTokens.set(address, count + 1);
+  // Track unknown tokens
+  const count = unknownTokens.get(mint) || 0;
+  unknownTokens.set(mint, count + 1);
   
-  // Log periodically
-  if (count === 0 || count % 100 === 0) {
-    logger.debug({ address, count }, 'Unknown token address');
+  if (count === 0) {
+    logger.info({ mint }, 'Unknown token mint');
   }
   
-  return undefined;
-}
-
-/**
- * Calculate USD value using token info
- */
-function calculateUsdValue(
-  amount: bigint,
-  tokenInfo?: TokenInfo
-): number | undefined {
-  if (!tokenInfo) {
-    return undefined;
-  }
-
-  const decimals = tokenInfo.decimals;
-  const rawAmount = Number(amount) / Math.pow(10, decimals);
-
-  if (tokenInfo.estimatedPrice !== undefined) {
-    return rawAmount * tokenInfo.estimatedPrice;
-  }
-
-  // Fallback for stablecoins
-  if (tokenInfo.symbol === 'USDC' || tokenInfo.symbol === 'USDT' || tokenInfo.symbol === 'DAI') {
-    return rawAmount;
-  }
-
   return undefined;
 }
 
@@ -422,7 +372,7 @@ export async function parseTransactions(
     }
   }
   
-  if (parseStats.total % 1000 === 0) {
+  if (parseStats.total % 500 === 0) {
     logger.info({
       total: parseStats.total,
       success: parseStats.success,
