@@ -102,10 +102,11 @@ export function TopTokens({ tokens }: TopTokensProps) {
                     backgroundColor: '#1A1A2E',
                     border: '1px solid #2D2D44',
                     borderRadius: '8px',
-                    color: '#ffffff',
                   }}
-                  labelStyle={{ color: '#ffffff' }}
+                  labelStyle={{ color: '#ffffff', fontWeight: 500 }}
+                  itemStyle={{ color: '#ffffff' }}
                   formatter={(value: number) => [formatUsd(value), 'Volume']}
+                  cursor={{ fill: 'rgba(123, 63, 228, 0.1)' }}
                 />
                 <Bar dataKey="volumeUsd" radius={[0, 4, 4, 0]}>
                   {tokensWithVolume.slice(0, 6).map((_, index) => (
