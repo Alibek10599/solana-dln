@@ -340,6 +340,8 @@ function ChainBreakdownChart({ title, data }: { title: string; data: ChainStats[
                   border: '1px solid #2D2D44',
                   borderRadius: '8px',
                 }}
+                labelStyle={{ color: '#ffffff' }}
+                itemStyle={{ color: '#ffffff' }}
                 formatter={(value: number) => [value.toLocaleString(), 'Orders']}
               />
               <Legend />

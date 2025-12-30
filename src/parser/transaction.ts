@@ -27,17 +27,31 @@ const unknownTokens = new Map<string, number>();
 // DLN Source discriminator for create_order
 const CREATE_ORDER_DISCRIMINATOR = '828362be28ce4432';
 
+// Chain ID constants
+const SOLANA_CHAIN_ID = 7565164;
+const ETHEREUM_CHAIN_ID = 1;
+const OPTIMISM_CHAIN_ID = 10;
+const BSC_CHAIN_ID = 56;
+const POLYGON_CHAIN_ID = 137;
+const BASE_CHAIN_ID = 8453;
+const ARBITRUM_CHAIN_ID = 42161;
+const AVALANCHE_CHAIN_ID = 43114;
+
 // Known chain IDs
 const CHAIN_IDS: Record<number, string> = {
-  1: 'Ethereum',
-  10: 'Optimism',
-  56: 'BSC',
-  137: 'Polygon',
-  8453: 'Base',
-  42161: 'Arbitrum',
-  43114: 'Avalanche',
-  7565164: 'Solana',
+  [ETHEREUM_CHAIN_ID]: 'Ethereum',
+  [OPTIMISM_CHAIN_ID]: 'Optimism',
+  [BSC_CHAIN_ID]: 'BSC',
+  [POLYGON_CHAIN_ID]: 'Polygon',
+  [BASE_CHAIN_ID]: 'Base',
+  [ARBITRUM_CHAIN_ID]: 'Arbitrum',
+  [AVALANCHE_CHAIN_ID]: 'Avalanche',
+  [SOLANA_CHAIN_ID]: 'Solana',
 };
+
+// Parser configuration constants
+const CHAIN_ID_MAX_VALUE = 10_000_000; // Maximum valid chain ID
+const TAKE_CHAIN_SCAN_START_OFFSET = 100; // Offset to start scanning for take chain (after give section)
 
 /**
  * Parse a transaction and extract DLN order events
@@ -169,7 +183,7 @@ function parseOrderEventFromLogs(logs: string[]): {
 
           if (solanaIndex !== -1) {
             // Found Solana chain ID - it's likely the give chain (source)
-            giveChainId = 7565164;
+            giveChainId = SOLANA_CHAIN_ID;
             logger.info({ solanaIndex, giveChainId }, 'Found Solana chain ID');
 
             // Look for other chain IDs nearby
@@ -177,7 +191,7 @@ function parseOrderEventFromLogs(logs: string[]): {
             const scannedChainIds: Array<{offset: number, value: number, inMap: boolean}> = [];
             for (let i = 40; i < data.length - 8; i += 8) {
               const possibleChainId = Number(data.readBigUInt64LE(i));
-              if (possibleChainId > 0 && possibleChainId < 1000000 && possibleChainId !== 7565164) {
+              if (possibleChainId > 0 && possibleChainId < CHAIN_ID_MAX_VALUE && possibleChainId !== SOLANA_CHAIN_ID) {
                 const inMap = !!CHAIN_IDS[possibleChainId];
                 scannedChainIds.push({ offset: i, value: possibleChainId, inMap });
                 if (inMap) {
@@ -270,27 +284,41 @@ function parseSourceInstruction(
     const giveAmountRaw = buffer.readBigUInt64LE(8);
 
     // Scan for take_chain_id by searching for known chain IDs in the buffer
-    // Known chain IDs: 1 (Ethereum), 56 (BSC), 137 (Polygon), 42161 (Arbitrum), 8453 (Base), 7565164 (Solana)
     let takeChainId: number | undefined;
 
-    // Scan the entire buffer in 8-byte increments looking for valid chain IDs
-    for (let offset = 16; offset < buffer.length - 8; offset += 8) {
+    // Scan the entire buffer at EVERY offset (not just 8-byte aligned) for chain IDs
+    // First pass: look for any chain ID that's not Solana (for cross-chain orders)
+    for (let offset = 16; offset < buffer.length - 8; offset++) {
       try {
         const chainIdBigInt = buffer.readBigUInt64LE(offset);
         const chainIdNum = Number(chainIdBigInt);
 
         // Check if this looks like a known chain ID
-        if (chainIdNum > 0 && chainIdNum < 10000000) {
-          if (CHAIN_IDS[chainIdNum]) {
-            // Found a recognized chain ID, but make sure it's not the give chain (Solana)
-            if (chainIdNum !== 7565164) {
-              takeChainId = chainIdNum;
-              break;
-            }
+        if (chainIdNum > 0 && chainIdNum < CHAIN_ID_MAX_VALUE) {
+          if (CHAIN_IDS[chainIdNum] && chainIdNum !== SOLANA_CHAIN_ID) {
+            // Found a non-Solana chain ID
+            takeChainId = chainIdNum;
+            break;
           }
         }
       } catch {
         continue;
+      }
+    }
+
+    // Second pass: if no cross-chain ID found, look for Solana (for Solana→Solana orders)
+    if (!takeChainId) {
+      for (let offset = TAKE_CHAIN_SCAN_START_OFFSET; offset < buffer.length - 8; offset++) {
+        try {
+          const chainIdBigInt = buffer.readBigUInt64LE(offset);
+          if (chainIdBigInt === BigInt(SOLANA_CHAIN_ID)) {
+            // Found second Solana chain ID (this is the take chain for Solana→Solana orders)
+            takeChainId = SOLANA_CHAIN_ID;
+            break;
+          }
+        } catch {
+          continue;
+        }
       }
     }
 
@@ -322,7 +350,7 @@ function parseSourceInstruction(
     }
 
     // Get chain IDs - give_chain is always Solana for created orders, take_chain from instruction data
-    const giveChainId = 7565164; // Solana
+    const giveChainId = SOLANA_CHAIN_ID;
 
     // Try to get take token symbol from instruction data
     // After offset 48, we have length-prefixed fields
@@ -437,7 +465,7 @@ function parseDestinationInstruction(
       take_token_symbol: takeTokenSymbol,
       take_amount: takeAmount,
       take_amount_usd: takeAmountUsd,
-      take_chain_id: 7565164, // Solana
+      take_chain_id: SOLANA_CHAIN_ID,
     };
   } catch (error) {
     logger.debug({ error, signature }, 'Failed to parse destination instruction');
