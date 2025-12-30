@@ -399,6 +399,23 @@ export async function fetchAndParseTransactions(
     const allEvents = await parseTransactions(transactions, input.signatures);
     const events = allEvents.filter(e => e.event_type === input.eventType);
 
+    // DEBUG: Log chain ID info for created orders
+    const createdOrders = events.filter(e => e.event_type === 'created');
+    if (createdOrders.length > 0) {
+      const sample = createdOrders.slice(0, 3);
+      logger.info({
+        eventType: 'created',
+        totalCreated: createdOrders.length,
+        sampleOrders: sample.map(e => ({
+          orderId: e.order_id.slice(0, 16),
+          giveChainId: e.give_chain_id,
+          takeChainId: e.take_chain_id,
+          giveSymbol: e.give_token_symbol,
+          takeSymbol: e.take_token_symbol,
+        })),
+      }, 'Created orders chain ID status');
+    }
+
     // Serialize for Temporal
     const serializedEvents = events.map(e => ({
       ...e,
@@ -406,6 +423,9 @@ export async function fetchAndParseTransactions(
       take_amount: e.take_amount ? e.take_amount.toString() : undefined,
       fulfilled_amount: e.fulfilled_amount ? e.fulfilled_amount.toString() : undefined,
       block_time: e.block_time.toISOString(),
+      // Explicitly include chain IDs to prevent JSON omission of undefined
+      give_chain_id: e.give_chain_id ?? null,
+      take_chain_id: e.take_chain_id ?? null,
     })) as any;
 
     logger.info({
